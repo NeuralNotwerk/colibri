@@ -22,6 +22,7 @@
 
 #include <stdio.h>
 #include <stddef.h>
+#include <string.h>
 #include <windows.h>
 
 #include "backend_cuda.h"
@@ -136,9 +137,30 @@ static int coli_cuda_load(void){
     if(g_cuda.loaded) return g_cuda.available;
     g_cuda.loaded = 1;
 
-    /* Search the model directory first (so a DLL shipped next to the model
-     * wins), then the engine directory, then the default DLL search path. */
-    g_cuda.dll = LoadLibraryA("coli_cuda.dll");
+    /* Load coli_cuda.dll from the engine's OWN directory, by absolute path —
+     * never a bare name. LoadLibraryA("coli_cuda.dll") searches the current
+     * working directory (and, without SafeDllSearchMode, other writable dirs):
+     * an attacker who drops a coli_cuda.dll where the user launches glm.exe (or
+     * inside a downloaded model directory the user cd's into) would get their
+     * DllMain run at load — classic DLL hijacking -> arbitrary code execution.
+     * Resolving the path next to glm.exe and loading THAT specific file with
+     * LOAD_WITH_ALTERED_SEARCH_PATH anchors both the DLL and its dependency
+     * search to the trusted install directory instead of the CWD. */
+    char dllpath[MAX_PATH];
+    DWORD mn = GetModuleFileNameA(NULL, dllpath, (DWORD)sizeof(dllpath));
+    if(mn > 0 && mn < sizeof(dllpath)){
+        char *slash = strrchr(dllpath, '\\');
+        if(slash && (size_t)(slash + 1 - dllpath) + sizeof("coli_cuda.dll") <= sizeof(dllpath)){
+            strcpy(slash + 1, "coli_cuda.dll");
+            g_cuda.dll = LoadLibraryExA(dllpath, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+        }
+    }
+    if(!g_cuda.dll){
+        /* fallback (GetModuleFileNameA praticamente non fallisce): cerca solo
+         * nella dir dell'applicazione e in System32, MAI la CWD. */
+        g_cuda.dll = LoadLibraryExA("coli_cuda.dll", NULL,
+            LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
     if(!g_cuda.dll){
         fprintf(stderr, "[CUDA] coli_cuda.dll not found; GPU tier disabled "
                         "(CPU path remains active).\n");

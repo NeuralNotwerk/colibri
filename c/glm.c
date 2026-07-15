@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <math.h>
 #include <time.h>
 #include <limits.h>
@@ -95,7 +96,7 @@ typedef struct {
  * INT4 e' cio' che fa stare la densa residente nei 15 GB (0.5 byte/param). */
 /* fmt: 0 F32, 1 INT8, 2 INT4 (2/byte), 3 INT2 (4/byte). q4 ospita sia int4 che int2 packed. */
 typedef struct {
-    int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I;
+    int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;  /* gs=group size (0=per-row, 128=grouped) */
 #ifdef COLI_CUDA
     ColiCudaTensor *cuda;
 #endif
@@ -106,7 +107,10 @@ static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
     if(t->fmt==0) return n*4;
     if(t->fmt==1) return n + (int64_t)t->O*4;
     if(t->fmt==3) return (int64_t)t->O*((t->I+3)/4) + (int64_t)t->O*4;
-    return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*4;
+    if(t->fmt==4){ /* int4 grouped: packed nibbles + O*ceil(I/gs) scales */
+        int ng=(t->I+t->gs-1)/t->gs;
+        return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*ng*4; }
+    return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*4;  /* fmt=2 int4 per-row */
 }
 
 typedef struct {
@@ -184,6 +188,12 @@ typedef struct {
     double t_edisk, t_ewait, t_emm, t_attn, t_kvb, t_head;/* profiling: dove va il tempo */
     double t_aproj,t_acore,t_aout;                     /* attention breakdown */
     int64_t resident_bytes;
+    /* DISK_SPLIT=1: split dei DISK LOAD (miss LRU -> expert_load) per contesto e per tipo
+     * di layer. ld_ctx: 0=main/verify/prefill, 1=dentro mtp_draft, 2=dentro mtp_absorb. */
+    int ld_ctx;
+    uint64_t miss_draft, miss_absorb;            /* miss in moe() per contesto */
+    uint64_t ld_mtp, ld_main;                    /* expert_load per tipo layer (MTP int8 vs main int4) */
+    uint64_t bytes_mtp, bytes_main;              /* byte letti da disco per tipo layer */
 } Model;
 
 static void usage_save(Model *m);        /* cache che impara: definita accanto a stats_dump */
@@ -372,6 +382,46 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
                 a += xs[i]*(float)lo + xs[i+1]*(float)hi; }
             if(i<I){ uint8_t byte=w[i>>1]; int lo=(int)(byte&0xF)-8; a += xs[i]*(float)lo; }
             y[(int64_t)s*O+o]=a*sc; } }
+}
+/* y[S,O] = x[S,I] @ W^T with W int4 packed (2/byte) + per-GROUP scales (fmt=4).
+ * Same nibble math as matmul_i4, but the scale changes every `gs` elements along I.
+ * The accumulator resets at each group boundary: dot(x[grp], w[grp]) * scale[grp].
+ * gs MUST be a multiple of 16 (the AVX2 vector width). */
+static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
+                              int S, int I, int O, int gs){
+    int rb=(I+1)/2; int ng=(I+gs-1)/gs;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *w=q4+(int64_t)o*rb;
+        const float *scl=scale+(int64_t)o*ng;
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I; float a=0;
+            for(int g=0; g*gs<I; g++){
+                int base=g*gs; int glen=gs; if(base+glen>I) glen=I-base;
+                float sc=scl[g];
+                int i=base;
+#ifdef __AVX2__
+                const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
+                __m256 acc=_mm256_setzero_ps();
+                for(; i+16<=base+glen; i+=16){ __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));
+                    __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+                    __m128i nib=_mm_unpacklo_epi8(lo,hi);
+                    __m256 w0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nib),b8));
+                    __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8));
+                    acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
+                    acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
+                a+=hsum256(acc)*sc;
+#endif
+                /* scalar tail for the group remainder */
+                for(; i<base+glen; i+=2){
+                    if(i+1<base+glen){ uint8_t byte=w[i>>1];
+                        a+=(xs[i]*(float)((int)(byte&0xF)-8)+xs[i+1]*(float)((int)(byte>>4)-8))*sc; }
+                    else { uint8_t byte=w[i>>1]; a+=xs[i]*(float)((int)(byte&0xF)-8)*sc; }
+                }
+            }
+            y[(int64_t)s*O+o]=a;
+        }
+    }
 }
 /* Decode hot path for gate+up: same exact q4 dot products as matmul_i4, but one
  * OpenMP dispatch covers both matrices. KTransformers uses persistent pools;
@@ -765,6 +815,9 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     }
 #endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
+    /* fmt=4: grouped int4 — always use the exact grouped kernel (no IDOT approximation,
+     * since the whole point of grouped scales is better quality). */
+    if(w->fmt==4){ matmul_i4_grouped(y,x,w->q4,w->s,S,w->I,w->O,w->gs); return; }
     /* int8 IDOT vince sempre (1.4-2.5x). int4 IDOT: l'autore su AVX2 trovo' che a S=1
      * non ripaga (soglia S>=2); ma su ARM/SDOT il singolo token CONVIENE (vedi g_i4s /
      * PR #9 per il gemello VNNI). Soglia configurabile con I4S.
@@ -903,6 +956,11 @@ static int64_t la_hit[4], la_tot[4];  /* [0]=prev, [1]=skip-attn, [2]=PILOT, [3]
 static int la_pred[3][130][16]; static signed char la_val[3][130];
 static int g_pilot=0;    /* PILOT=1: prefetch pilotato dal router (vedi pilot_prefetch) */
 static int g_pilot_k=8;  /* PILOT_K=k: prefetcha solo le prime k predizioni per posizione */
+static int g_disk_split=0; /* DISK_SPLIT=1: contatori che spezzano i DISK LOAD (miss LRU) in
+                          * draft MTP / absorb / verify-main e in layer MTP (int8) vs main
+                          * (int4), con i byte letti. Default OFF: a flag spento gli atomic
+                          * non vengono MAI toccati (zero overhead), le righe extra di stats
+                          * non vengono stampate. Solo misura: nessun effetto sull'output. */
 /* Aligned allocator for dense QT weights/scales: under METAL, page-align + register so the
  * GPU reads them zero-copy (no upload duplicate). Plain malloc otherwise. */
 static void *qalloc(size_t n){
@@ -1060,9 +1118,22 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
     char sn[300]; snprintf(sn,sizeof(sn),"%s.qs",name);
     if(st_has(&m->S,sn)){
         int64_t nb=st_nbytes(&m->S,name);
-        int fmt = (nb==(int64_t)O*I)?1 : (nb==(int64_t)O*((I+1)/2))?2 : 3;  /* int8 / int4 / int2 dai byte */
-        if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->q8=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
-        else      { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->q4=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q4,drop); }
+        int64_t ns=st_nbytes(&m->S,sn);   /* scale bytes (F32) */
+        /* Detect int4-grouped (fmt=4): packed int4 weight bytes BUT scale array is
+         * larger than O*4 — check if it matches O*ceil(I/gs)*4 for gs=128. */
+        int fmt = (nb==(int64_t)O*I)?1 : (nb==(int64_t)O*((I+1)/2))?2 : 3;
+        int gs=0;
+        if(fmt==2 && ns > (int64_t)O*4){
+            /* could be grouped; try gs=128 */
+            int ng128=(I+127)/128;
+            if(ns==(int64_t)O*ng128*4){ fmt=4; gs=128; }
+            /* future: try other group sizes here */
+        }
+        if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->gs=0; t->q8=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
+        else if(fmt==4){ int ng=(I+gs-1)/gs;
+            if(t->fmt!=4||!t->q4){ t->fmt=4; t->O=O; t->I=I; t->gs=gs; t->q4=qalloc(nb); t->s=falloc((int64_t)O*ng); }
+            st_read_raw(&m->S,name,t->q4,drop); }
+        else      { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q4,drop); }
         st_read_f32(&m->S,sn,t->s,drop);
     } else {
         if(!t->qf && !t->q8 && !t->q4) qt_alloc(t,O,I,bits);
@@ -1332,6 +1403,24 @@ static void *map_of_fd(int fd){
  * pread error aborts the process. fatal=0 (speculative pilot only): the same
  * errors instead abandon the load and return -1 without touching s->eid, so a
  * mispredicted cross-layer prefetch can never kill the server. */
+/* pread completo: gestisce le short-read (POSIX le ammette su file regolari
+ * sotto pressione di memoria) e le EINTR, e riporta un errore ONESTO. perror
+ * stampava "Success" quando pread ritorna un conteggio corto invece di -1
+ * (errno resta 0 dalla syscall precedente) -> messaggio fuorviante nel path
+ * score/bench (#236). Ritorna 0 = ok, -1 = errore reale o EOF. */
+static int pread_full(int fd, void *buf, int64_t n, int64_t off, const char *tag){
+    char *p=buf; int64_t got=0;
+    while(got<n){
+        ssize_t r=pread(fd, p+got, (size_t)(n-got), off+got);
+        if(r<0){ if(errno==EINTR) continue;
+            fprintf(stderr,"%s: %s (off %lld, %lld/%lld bytes)\n",tag,strerror(errno),
+                    (long long)off,(long long)got,(long long)n); return -1; }
+        if(r==0){ fprintf(stderr,"%s: short read at EOF (off %lld, %lld/%lld bytes) — truncated shard?\n",
+                    tag,(long long)off,(long long)got,(long long)n); return -1; }
+        got+=r;
+    }
+    return 0;
+}
 static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
 #ifdef COLI_CUDA
     /* A live REPIN may reuse a GPU-enabled pinned slot for a different expert.
@@ -1356,6 +1445,13 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
         snprintf(qn,sizeof(qn),"%s.qs",nm[k]); tq[k]=st_find(&m->S,qn);
         if(!tw[k]||!tq[k]){ fprintf(stderr,"missing %s\n",nm[k]); if(fatal) exit(1); return -1; }
     }
+    if(g_disk_split){ /* split load/byte per tipo layer; atomici: expert_load gira anche su OMP/pipe/pilot */
+        int64_t tb=0; for(int k=0;k<3;k++) tb+=tw[k]->nbytes+tq[k]->nbytes;
+        if(layer==c->n_layers){ __atomic_add_fetch(&m->ld_mtp,1,__ATOMIC_RELAXED);
+                                __atomic_add_fetch(&m->bytes_mtp,(uint64_t)tb,__ATOMIC_RELAXED); }
+        else                  { __atomic_add_fetch(&m->ld_main,1,__ATOMIC_RELAXED);
+                                __atomic_add_fetch(&m->bytes_main,(uint64_t)tb,__ATOMIC_RELAXED); }
+    }
     if(g_mmap){
         void *bw[3],*bq[3]; int okm=1;
         for(int k=0;k<3;k++){
@@ -1367,7 +1463,13 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
             for(int k=0;k<3;k++){
                 int64_t nb=tw[k]->nbytes;
                 int fmt=(nb==(int64_t)OO[k]*II[k])?1:(nb==(int64_t)OO[k]*((II[k]+1)/2))?2:3;
-                qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
+                /* detect grouped int4 (fmt=4): int4 weight bytes + larger scale array */
+                int gs=0;
+                if(fmt==2 && tq[k]->nbytes > (int64_t)OO[k]*4){
+                    int ng128=(II[k]+127)/128;
+                    if(tq[k]->nbytes==(int64_t)OO[k]*ng128*4){ fmt=4; gs=128; }
+                }
+                qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
                 qt[k]->q8=(int8_t*)((char*)bw[k]+tw[k]->off); qt[k]->q4=(uint8_t*)((char*)bw[k]+tw[k]->off);
                 qt[k]->s=(float*)((char*)bq[k]+tq[k]->off);
             }
@@ -1465,19 +1567,19 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
             }
         }
         if(!done){                               /* fallback bufferizzato */
-            if(pread(tw[ord[0]]->fd, s->slab, wtot, off0)!=wtot){ perror("pread expert"); if(fatal) exit(1); return -1; }
+            if(pread_full(tw[ord[0]]->fd, s->slab, wtot, off0, "pread expert")){ if(fatal) exit(1); return -1; }
             pos[ord[0]]=0; pos[ord[1]]=tw[ord[0]]->nbytes; pos[ord[2]]=tw[ord[0]]->nbytes+tw[ord[1]]->nbytes; done=1;
         }
     }
     if(!done){                                   /* non contigui: 3 pread bufferizzate */
         int64_t o=0;
         for(int a=0;a<3;a++){ int k=ord[a];
-            if(pread(tw[k]->fd, s->slab+o, tw[k]->nbytes, tw[k]->off)!=tw[k]->nbytes){ perror("pread expert"); if(fatal) exit(1); return -1; }
+            if(pread_full(tw[k]->fd, s->slab+o, tw[k]->nbytes, tw[k]->off, "pread expert")){ if(fatal) exit(1); return -1; }
             pos[k]=o; o+=tw[k]->nbytes; }
     }
     float *fp[3]; int64_t fo=0;                  /* scale (piccole) */
     for(int k=0;k<3;k++){
-        if(pread(tq[k]->fd, (char*)(s->fslab+fo), tq[k]->nbytes, tq[k]->off)!=tq[k]->nbytes){ perror("pread qs"); if(fatal) exit(1); return -1; }
+        if(pread_full(tq[k]->fd, (char*)(s->fslab+fo), tq[k]->nbytes, tq[k]->off, "pread qs")){ if(fatal) exit(1); return -1; }
         fp[k]=s->fslab+fo; fo+=tq[k]->nbytes/4; }
     if(g_drop){                                  /* scarta subito le pagine: evita che la page
                                                   * cache in pressione strangoli il throughput */
@@ -1488,7 +1590,12 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
     for(int k=0;k<3;k++){
         int64_t nb=tw[k]->nbytes;
         int fmt = (nb==(int64_t)OO[k]*II[k])?1 : (nb==(int64_t)OO[k]*((II[k]+1)/2))?2 : 3;
-        qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
+        int gs=0;
+        if(fmt==2 && tq[k]->nbytes > (int64_t)OO[k]*4){
+            int ng128=(II[k]+127)/128;
+            if(tq[k]->nbytes==(int64_t)OO[k]*ng128*4){ fmt=4; gs=128; }
+        }
+        qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
     }
     s->eid=eid; return 0;
@@ -2342,7 +2449,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ m->hits++; use[j]=&P[z]; break; }
             if(!use[j]){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
                 for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ m->hits++; Sl[z].used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); use[j]=&Sl[z]; break; } }
-            if(!use[j]){ qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++; }
+            if(!use[j]){ qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++;
+                if(g_disk_split){ if(m->ld_ctx==1) m->miss_draft++; else if(m->ld_ctx==2) m->miss_absorb++; } }
         }
         int metal_done=0;
 #ifdef COLI_METAL
@@ -3080,7 +3188,6 @@ static void kv_alloc(Model *m, int max_t){
         m->kv_dev_valid[i]=0;
     }
 #endif
-    if(k->Lc){ for(int i=0;i<c->n_layers+1;i++){ free(k->Lc[i]); free(k->Rc[i]); } free(k->Lc); free(k->Rc); }
     if(k->Lc){ for(int i=0;i<c->n_layers+1;i++){
 #ifdef COLI_METAL
         if(g_metal_enabled){ coli_metal_unregister(k->Lc[i]); coli_metal_unregister(k->Rc[i]); }
@@ -3214,6 +3321,7 @@ static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
     float *row=falloc(D), *logit=falloc(c->vocab), *h=falloc(D);
     memcpy(h, m->hlast, D*sizeof(float));
     int tok=next_tok, n=0;
+    m->ld_ctx=1;                                 /* DISK_SPLIT: i load da qui sono draft-path */
     int prenorm = getenv("MTP_PRENORM")!=NULL;
     for(int g=0; g<G; g++){
         int pos=p+g; if(pos+2>=m->max_t) break;
@@ -3238,6 +3346,7 @@ static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
                         pos, tok, sqrt(n_eh), sqrt(n_post), t_pre, t2);
         draft[n++]=t2; tok=t2; memcpy(h, hx, D*sizeof(float));
     }
+    m->ld_ctx=0;
     free(x); free(cat); free(hx); free(nrm); free(tmp); free(row); free(logit); free(h);
     return n;
 }
@@ -3261,7 +3370,9 @@ static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int
         matmul_qt(hx+(int64_t)i*D, cat, &m->eh_proj, 1);
     }
     float *nrm=falloc((int64_t)S*D), *tmp=falloc((int64_t)S*D);
+    m->ld_ctx=2;                                 /* DISK_SPLIT: load del layer MTP in absorb */
     layer_forward(m,&m->mtpL,li,hx,S,pos_base,nrm,tmp);
+    m->ld_ctx=0;
     free(hx); free(cat); free(e); free(hn); free(hf); free(nrm); free(tmp);
 }
 
@@ -3519,16 +3630,43 @@ static double logprob_target(const float *lo, int V, int target, int *am){
     if(am)*am=(best==target);
     return (double)(lo[target]-mx) - log(se);
 }
+/* "glm" contenuto in model_type, case-insensitive — stessa regola di detect_prefix
+ * in tools/eval_glm.py (#194). Niente strcasestr: non esiste su MinGW/MSVC. */
+static int mt_is_glm(const char *s){
+    if(s) for(;*s;s++) if((s[0]|32)=='g'&&(s[1]|32)=='l'&&(s[2]|32)=='m') return 1;
+    return 0;
+}
 /* modalita' SCORING per i benchmark (stile lm-eval, log-likelihood):
  * input: file con righe "<ctxlen> <contlen> <id0> .. <id_{T-1}>"  (T=ctxlen+contlen)
  * output: riga "<logprob_continuazione> <contlen> <greedy 0/1>" per richiesta.
  * Un solo forward per richiesta (teacher-forcing): niente generazione -> fattibile a bassa velocita'. */
-static void run_score(Model *m, const char *path){
+static void run_score(Model *m, const char *snap, const char *path){
     Cfg *c=&m->c; int D=c->hidden;
+    /* prefisso GLM (#108): il modello vede [gMASK]<sop> in testa a OGNI sequenza di training —
+     * scorare stream nudi e' out-of-distribution e deprime/distorce i punteggi. Se il config
+     * dice glm* gli id dei due token vengono chiesti al tokenizer.json dello snapshot (per
+     * GLM-5.2: 154822,154824 — mai fidarsi di costanti cablate, il vocabolario cambia tra
+     * release) e anteposti al CONTESTO delle richieste che non li hanno gia'; chi arriva GIA'
+     * prefissato (eval_glm.py post-#194) passa INTATTO. SCORE_PREFIX=0 -> comportamento nudo. */
+    int pfx[2]={-1,-1}, pfx_on=0;
+    if(!getenv("SCORE_PREFIX")||atoi(getenv("SCORE_PREFIX"))){
+        char *ar=NULL; jval *r=cfg_root(snap,&ar);
+        jval *mt=json_get(r,"model_type");
+        if(mt_is_glm(mt?mt->str:NULL)){
+            char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
+            Tok T; tok_load(&T,tkp);
+            pfx[0]=tok_id_of(&T,"[gMASK]"); pfx[1]=tok_id_of(&T,"<sop>");
+            if(pfx[0]>=0&&pfx[1]>=0){ pfx_on=1;
+                fprintf(stderr,"[SCORE] GLM snapshot: prepending [gMASK]<sop> (ids %d,%d) to unprefixed requests — disable with SCORE_PREFIX=0\n",pfx[0],pfx[1]);
+            } else fprintf(stderr,"[SCORE] GLM config but tokenizer has no [gMASK]/<sop>: prefix OFF\n");
+        }
+        free(ar);
+    }
     FILE *f=fopen(path,"rb"); if(!f){perror(path);exit(1);}
     int maxT=1; { char *ln=NULL; size_t cp=0;
         while(getline(&ln,&cp,f)>0){ int a,b; if(sscanf(ln,"%d %d",&a,&b)==2 && a+b>maxT) maxT=a+b; }
         free(ln); }
+    if(pfx_on) maxT+=2;   /* le richieste senza prefisso crescono di 2 token */
     kv_alloc(m,maxT);
     float *x=falloc((int64_t)maxT*D), *lo=falloc(c->vocab), *row=falloc(D);
     int *ids=malloc(maxT*sizeof(int));
@@ -3537,6 +3675,10 @@ static void run_score(Model *m, const char *path){
         char *p=ln; int ctxlen=strtol(p,&p,10), contlen=strtol(p,&p,10), T=ctxlen+contlen;
         if(T<=0||ctxlen<1){ printf("0 0 0\n"); fflush(stdout); continue; }
         for(int i=0;i<T;i++) ids[i]=strtol(p,&p,10);
+        if(pfx_on && !(T>=2 && ids[0]==pfx[0] && ids[1]==pfx[1])){   /* gia' prefissato -> intatto */
+            memmove(ids+2,ids,(size_t)T*sizeof(int));
+            ids[0]=pfx[0]; ids[1]=pfx[1]; ctxlen+=2; T+=2;
+        }
         for(int s=0;s<T;s++) embed_row(m, ids[s], x+(int64_t)s*D);
         layers_forward(m,x,T,0);
         double lp=0; int greedy=1;
@@ -3669,6 +3811,13 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     if(g_cp_enq) printf("couple: %ld cross-layer prefetch hints enqueued\n", g_cp_enq);
     if(g_gr_prop) printf("grammar: %.0f%% acceptance (%llu/%llu forced drafts)\n",
         100.0*g_gr_acc/g_gr_prop, (unsigned long long)g_gr_acc, (unsigned long long)g_gr_prop);
+    if(g_disk_split) printf("disk-load split: draft %llu + absorb %llu + verify/main %llu misses | "
+           "MTP-layer %llu loads %.2f GB | main-layers %llu loads %.2f GB (MTP %.1f%% of bytes)\n",
+        (unsigned long long)m->miss_draft, (unsigned long long)m->miss_absorb,
+        (unsigned long long)(m->miss - m->miss_draft - m->miss_absorb),
+        (unsigned long long)m->ld_mtp, m->bytes_mtp/1e9,
+        (unsigned long long)m->ld_main, m->bytes_main/1e9,
+        (m->bytes_mtp+m->bytes_main)?100.0*m->bytes_mtp/(m->bytes_mtp+m->bytes_main):0.0);
 #ifdef COLI_CUDA
     if(m->gpu_expert_count) printf("CUDA expert tier: %d resident experts (%.2f GB) | %llu calls served from VRAM\n",
         m->gpu_expert_count,m->gpu_expert_bytes/1e9,(unsigned long long)m->gpu_expert_calls);
@@ -4546,6 +4695,7 @@ typedef struct { int l,e; uint32_t c; } PinRec;
 static int pin_rec_cmp(const void *a,const void *b){
     const PinRec *x=a,*y=b; return x->c<y->c?1:x->c>y->c?-1:0;
 }
+static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx);  /* def. sotto */
 static void pin_load(Model *m, const char *statspath, double gb){
     FILE *f=fopen(statspath,"r"); if(!f){ perror(statspath); return; }
     Cfg *c=&m->c; int cap=(c->n_layers+1)*c->n_experts;
@@ -4571,7 +4721,19 @@ static void pin_load(Model *m, const char *statspath, double gb){
     free(seen);
     qsort(r,(size_t)n,sizeof(*r),pin_rec_cmp);
     int64_t eb=expert_bytes_probe(m,m->ebits);
-    int npin=gb<0?n:(int)(gb*1e9/eb); if(npin>n) npin=n;
+    /* PIN_GB=all (#80): NON "tutti" alla lettera. Pinnare l'intero set ignora il
+     * budget --ram e fa OOM-kill del kernel a meta' generazione (#229: host 92 GB
+     * ucciso con --ram 78, anon-rss 89 GB). Clampa a quanti expert entrano nel
+     * budget RAM, come AUTOPIN; il pin aggiorna resident_bytes, quindi cap_for_ram
+     * dopo restringe la LRU di conseguenza (nessun doppio conteggio). */
+    int npin;
+    if(gb<0){
+        double ram_env=getenv("RAM_GB")?atof(getenv("RAM_GB")):0.0;
+        int est_ctx=getenv("CTX")?atoi(getenv("CTX")):4096;   /* stesso default del call site */
+        double avail=expert_avail(m,ram_env,m->ebits,est_ctx);
+        npin=avail>0?(int)(avail/eb):0;
+    } else npin=(int)(gb*1e9/eb);
+    if(npin>n) npin=n;
     if(npin<1){ free(r); return; }
     int *cnt_l=calloc(c->n_layers+1,sizeof(int));   /* +1: riga MTP */
     for(int a=0;a<npin;a++) cnt_l[r[a].l]++;
@@ -4853,6 +5015,7 @@ int main(int argc, char **argv){
      * (best-measured this session) unless the user set PILOT_K explicitly. */
     g_pilot_k = getenv("PILOT_K")?atoi(getenv("PILOT_K")):(g_pilot_real?6:8);
     if(g_pilot_k<1) g_pilot_k=1;
+    g_disk_split = getenv("DISK_SPLIT")?atoi(getenv("DISK_SPLIT")):0; /* 1 = split dei disk load nelle stats */
     g_pipe = getenv("PIPE")?atoi(getenv("PIPE")):0;       /* default OFF: overlap expert load ‖ matmul (byte-identical; reorders I/O). PIPE=1 opts in */
     g_pipe_nw = getenv("PIPE_WORKERS")?atoi(getenv("PIPE_WORKERS")):8; /* I/O worker threads */
     if(g_pipe_nw<1) g_pipe_nw=1;
@@ -4986,7 +5149,7 @@ int main(int argc, char **argv){
     const char *stats=getenv("STATS");   /* STATS=<file> -> istogramma uso expert a fine run */
 
     /* modo scoring per benchmark: SCORE=<requests.txt> -> log-likelihood per riga */
-    if(getenv("SCORE")){ run_score(&m, getenv("SCORE")); if(stats) stats_dump(&m,stats); return 0; }
+    if(getenv("SCORE")){ run_score(&m, snap, getenv("SCORE")); if(stats) stats_dump(&m,stats); return 0; }
 
     /* modo serve persistente per la CLI 'coli': SERVE=1 */
     if(getenv("SERVE")){
