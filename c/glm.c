@@ -4165,13 +4165,20 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
     ServeReq *r=&req[sub.slot]; memset(r,0,sizeof(*r));
     r->id=sub.id; r->maximum=sub.max_tokens; r->temp=sub.temperature; r->top_p=sub.top_p;
     r->prompt_tokens=nt; r->started=now_s(); r->hits0=m->hits; r->miss0=m->miss;
-    int room=maxctx-sc->len-1; if(r->maximum>room){r->maximum=room; r->length_limited=1;}
+    /* Clamp to the KV room WITHOUT flagging: length_limited must mean "the
+     * limit is what stopped us", not "the request asked for more than the
+     * context could ever hold" — clients that default max_tokens to the
+     * context size would otherwise see finish_reason=length on every
+     * naturally-completed generation. The flag is set at the actual
+     * emitted>=maximum stops below instead. */
+    int room=maxctx-sc->len-1; if(r->maximum>room) r->maximum=room;
     g_temp=r->temp; g_nuc=r->top_p;
     int next=pick_tok(logit,m->c.vocab,-1); free(logit);
-    if(r->maximum<=0 || next==eos || is_stop(next)){ mux_done(m,sc,r); return 1; }
+    if(r->maximum<=0){ r->length_limited=1; mux_done(m,sc,r); return 1; }   /* no room at all */
+    if(next==eos || is_stop(next)){ mux_done(m,sc,r); return 1; }
     r->pending=next; r->emitted=1; r->active=1; sc->hist[sc->len]=next; m->n_emit++;
     mux_data(T,r->id,next);
-    if(r->emitted>=r->maximum) mux_done(m,sc,r);
+    if(r->emitted>=r->maximum){ r->length_limited=1; mux_done(m,sc,r); }
     return 1;
 }
 
@@ -4250,7 +4257,7 @@ static void run_serve_mux(Model *m, const char *snap){
             if(next==eos || is_stop(next)){mux_done(m,sc,r);continue;}
             r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++;
             mux_data(&T,r->id,next);
-            if(r->emitted>=r->maximum) mux_done(m,sc,r);
+            if(r->emitted>=r->maximum){ r->length_limited=1; mux_done(m,sc,r); }
         }
         free(lo);
     }
