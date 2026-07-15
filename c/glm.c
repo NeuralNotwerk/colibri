@@ -1294,6 +1294,13 @@ static void embed_row(Model *m, int tok, float *x){
 static int g_mmap=0;
 static struct { int fd; void *base; size_t len; } g_maps[512]; static int g_nmaps;
 static pthread_mutex_t g_map_mtx = PTHREAD_MUTEX_INITIALIZER;   /* expert_load e' OMP-parallel */
+/* forward decls: mem_should_wire/mem_wire live near pin_wire() further down, but
+ * qt_wire_mmap() (also further down, used by pin_wire()'s COLI_MMAP path) needs
+ * them declared before its own definition. Real mlock-ing of mmap'd pinned
+ * experts happens there, not in expert_load() -- see qt_wire_mmap() for why. */
+static int mem_should_wire(void);
+static int mem_wire(void *addr, size_t len);
+static int64_t g_mmap_wired=0; static long g_mmap_wire_failed=0;
 static void *map_of_fd(int fd){
     pthread_mutex_lock(&g_map_mtx);
     for(int i=0;i<g_nmaps;i++) if(g_maps[i].fd==fd){ void *b=g_maps[i].base; pthread_mutex_unlock(&g_map_mtx); return b; }
@@ -1378,6 +1385,13 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
                 acc+=p[n-1]; (void)acc;
                 char *q=(char*)bq[k]+tq[k]->off; size_t nq=(size_t)tq[k]->nbytes;
                 for(size_t i=0;i<nq;i+=4096) acc+=q[i];
+                /* mlock deliberately NOT done here: this fires for every expert_load call,
+                 * including the transient VRAM-staging pass in pin_load (host copy loaded,
+                 * uploaded to GPU, then "released" via expert_host_release -- which only
+                 * knows how to munlock s->slab, always NULL under mmap, so wiring here would
+                 * leak locked pages for every GPU-tier expert). See pin_wire() below: it wires
+                 * the final resident set only, after GPU release has already nulled out the
+                 * pointers for anything that isn't genuinely RAM-tier. */
             }
             s->eid=eid; return 0;
         }
@@ -4011,10 +4025,15 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
 static void run_serve_mux(Model *m, const char *snap){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp); int eos=tok_id_of(&T,"<|endoftext|>"); stops_arm(&m->c,eos);
-    g_draft=0; /* one scheduler owns every forward; MTP/speculation is not ragged-safe */
     int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
     int nctx=getenv("KV_SLOTS")?atoi(getenv("KV_SLOTS")):1;
     if(nctx<1||nctx>16){fprintf(stderr,"KV_SLOTS deve essere tra 1 e 16\n");exit(2);}
+    if(nctx>1){
+        if(g_draft>0) fprintf(stderr,"[MTP] DRAFT ignored: KV_SLOTS=%d (multiple ragged slots share one batched forward; MTP/speculation is not ragged-safe there)\n",nctx);
+        g_draft=0;
+    } else if(g_draft>0){
+        fprintf(stderr,"[MTP] DRAFT=%d honored: KV_SLOTS=1 (single active sequence, batching is serial — the ragged-safety concern above doesn't apply)\n",g_draft);
+    }
     g_kvsave=getenv("KVSAVE")?atoi(getenv("KVSAVE")):1;
     KVState *initial=m->kv; free(initial->kv_start); free(initial);
     ServeCtx *ctx=calloc(nctx,sizeof(*ctx)); ServeReq *req=calloc(nctx,sizeof(*req));
@@ -4477,8 +4496,37 @@ static int mem_wire(void *addr, size_t len){
 }
 /* Inchioda tutti gli slab degli expert pinnati (pesi + scale). Non fatale se fallisce.
  * EN: wire all pinned-expert slabs (weights + scales). Non-fatal on failure. */
+/* mlock a single mmap'd QT's weight + scale ranges. Skips QTs with no live host
+ * pointer (q8/q4 both NULL) -- that's expert_host_release()'s signature for
+ * "uploaded to GPU and released", the one case COLI_MMAP intentionally leaves
+ * unwired: those bytes are supposed to live in VRAM only, not double-pinned
+ * in host RAM too. wired/failed are accumulated into the caller's counters. */
+static void qt_wire_mmap(QT *t, int64_t *wired, long *failed){
+    if(!t->q8 && !t->q4) return;
+    int64_t scale_b=(int64_t)t->O*4;
+    int64_t weight_b=qt_bytes(t)-scale_b;
+    void *wp=t->q8?(void*)t->q8:(void*)t->q4;
+    if(weight_b>0){ if(mem_wire(wp,(size_t)weight_b)==0) *wired+=weight_b; else (*failed)++; }
+    if(t->s && scale_b>0){ if(mem_wire(t->s,(size_t)scale_b)==0) *wired+=scale_b; else (*failed)++; }
+}
 static void pin_wire(Model *m){
     if(!mem_should_wire()) return;
+    if(g_mmap){
+        /* Wire the FINAL resident set only, after pin_load's GPU-upload/release
+         * pass has already run -- anything released has q8/q4 nulled (see
+         * expert_host_release) and qt_wire_mmap() skips it, so VRAM-tier
+         * experts never get an orphaned, un-releasable host lock. */
+        Cfg *c=&m->c; double t0=now_s();
+        for(int i=0;i<c->n_layers;i++) for(int z=0;z<m->npin[i];z++){
+            ESlot *s=&m->pin[i][z];
+            qt_wire_mmap(&s->g,&g_mmap_wired,&g_mmap_wire_failed);
+            qt_wire_mmap(&s->u,&g_mmap_wired,&g_mmap_wire_failed);
+            qt_wire_mmap(&s->d,&g_mmap_wired,&g_mmap_wire_failed);
+        }
+        fprintf(stderr,"[PIN] mlock (mmap): %.1f GB wired in physical RAM%s in %.0fs\n",
+            g_mmap_wired/1e9, g_mmap_wire_failed?" (some allocations failed -- raise: ulimit -l unlimited)":"", now_s()-t0);
+        return;
+    }
     Cfg *c=&m->c; double t0=now_s(); int64_t wired=0; long failed=0;
     for(int i=0;i<c->n_layers;i++) for(int z=0;z<m->npin[i];z++){
         ESlot *s=&m->pin[i][z];
