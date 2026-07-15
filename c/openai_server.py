@@ -405,7 +405,11 @@ def generation_options(body, limit):
         maximum = body.get("max_tokens")
         maximum_param = "max_tokens"
     if maximum is None:
-        maximum = min(256, limit)
+        # unbounded by default: run to EOS/stop or the server limit (itself
+        # sized to the context window) instead of upstream's 256-token cap.
+        # The engine's per-request room clamp (CTX - prompt - 1) still applies
+        # and sets finish_reason="length" when hit.
+        maximum = limit
     temperature = body.get("temperature")
     top_p = body.get("top_p")
     temperature = 0.7 if temperature is None else temperature
