@@ -1371,6 +1371,7 @@ static pthread_mutex_t g_map_mtx = PTHREAD_MUTEX_INITIALIZER;   /* expert_load e
  * experts happens there, not in expert_load() -- see qt_wire_mmap() for why. */
 static int mem_should_wire(void);
 static int mem_wire(void *addr, size_t len);
+static void qt_unwire_mmap(QT *t);   /* def. presso pin_wire / defined near pin_wire */
 static int64_t g_mmap_wired=0; static long g_mmap_wire_failed=0;
 static void *map_of_fd(int fd){
     pthread_mutex_lock(&g_map_mtx);
@@ -3932,6 +3933,9 @@ static void repin_pass_limit(Model *m,int limit){
                 if(!qt_cuda_update(hq[k])) ok=0;
             }
             if(!ok){ fprintf(stderr,"[REPIN] refresh VRAM fallito\n"); exit(1); }
+            /* promoted expert now computes from VRAM: drop its host mlock
+             * (mmap path; no-op otherwise) or every swap leaks locked pages */
+            qt_unwire_mmap(&hot->g); qt_unwire_mmap(&hot->u); qt_unwire_mmap(&hot->d);
             if(g_cuda_release_host) expert_host_release(m,hot);
             gpu_swaps++;
             if(getenv("REPIN_VERBOSE")) fprintf(stderr,
@@ -4645,13 +4649,34 @@ static int mem_wire(void *addr, size_t len){
 }
 /* Inchioda tutti gli slab degli expert pinnati (pesi + scale). Non fatale se fallisce.
  * EN: wire all pinned-expert slabs (weights + scales). Non-fatal on failure. */
-/* mlock a single mmap'd QT's weight + scale ranges. Skips QTs with no live host
- * pointer (q8/q4 both NULL) -- that's expert_host_release()'s signature for
- * "uploaded to GPU and released", the one case COLI_MMAP intentionally leaves
- * unwired: those bytes are supposed to live in VRAM only, not double-pinned
- * in host RAM too. wired/failed are accumulated into the caller's counters. */
+/* mlock a single mmap'd QT's weight + scale ranges. Skips VRAM-tier QTs
+ * (cuda_eligible): their compute runs from device memory, so wiring the host
+ * mmap range would pin ~137 GB of never-touched file pages. NOTE the q8/q4
+ * NULL check alone is NOT enough here: expert_host_release() early-returns
+ * for mmap experts (no slab) without nulling the host pointers, so GPU-tier
+ * slots keep live-looking q8/q4 forever -- that was the bug that wired 363 GB
+ * instead of 231 GB and starved the kernel into page-cache thrashing.
+ * wired/failed are accumulated into the caller's counters. */
+/* undo qt_wire_mmap for one QT: used when a REPIN gpu_swap promotes a wired
+ * RAM-tier expert into VRAM -- without this every promotion leaks its locked
+ * host range and the dead-weight lock re-grows over a long session. */
+static void qt_unwire_mmap(QT *t){
+    if(!g_mmap || !mem_should_wire()) return;
+    if(!t->q8 && !t->q4) return;
+    int64_t scale_b=(int64_t)t->O*4;
+    int64_t weight_b=qt_bytes(t)-scale_b;
+    void *wp=t->q8?(void*)t->q8:(void*)t->q4;
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+    if(weight_b>0 && !munlock(wp,(size_t)weight_b)) g_mmap_wired-=weight_b;
+    if(t->s && scale_b>0 && !munlock(t->s,(size_t)scale_b)) g_mmap_wired-=scale_b;
+#elif defined(_WIN32)
+    if(weight_b>0 && !compat_munlock(wp,(size_t)weight_b)) g_mmap_wired-=weight_b;
+    if(t->s && scale_b>0 && !compat_munlock(t->s,(size_t)scale_b)) g_mmap_wired-=scale_b;
+#endif
+}
 static void qt_wire_mmap(QT *t, int64_t *wired, long *failed){
     if(!t->q8 && !t->q4) return;
+    if(t->cuda_eligible) return;   /* resident in VRAM; host range is dead weight */
     int64_t scale_b=(int64_t)t->O*4;
     int64_t weight_b=qt_bytes(t)-scale_b;
     void *wp=t->q8?(void*)t->q8:(void*)t->q4;
@@ -4661,10 +4686,9 @@ static void qt_wire_mmap(QT *t, int64_t *wired, long *failed){
 static void pin_wire(Model *m){
     if(!mem_should_wire()) return;
     if(g_mmap){
-        /* Wire the FINAL resident set only, after pin_load's GPU-upload/release
-         * pass has already run -- anything released has q8/q4 nulled (see
-         * expert_host_release) and qt_wire_mmap() skips it, so VRAM-tier
-         * experts never get an orphaned, un-releasable host lock. */
+        /* Wire the FINAL resident set only, after pin_load's GPU-upload pass
+         * has already run -- qt_wire_mmap() skips cuda_eligible (VRAM-tier)
+         * slots, so only the genuinely RAM-tier experts get locked. */
         Cfg *c=&m->c; double t0=now_s();
         for(int i=0;i<c->n_layers;i++) for(int z=0;z<m->npin[i];z++){
             ESlot *s=&m->pin[i][z];
