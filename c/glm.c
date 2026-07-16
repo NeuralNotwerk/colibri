@@ -219,6 +219,7 @@ static void emap_emit(Model *m);
 static void hits_emit(Model *m);
 static void hwinfo_emit(Model *m);
 static int g_repin;
+static int g_pin_freeze;  /* PIN_FREEZE=1: collocazione FISSA dopo il load (vedi parse in main) */
 static uint64_t g_last_repin;
 #ifdef COLI_CUDA
 static int g_cuda_enabled;
@@ -6161,6 +6162,17 @@ int main(int argc, char **argv){
         else fprintf(stderr,"[ROUTE_TRACE] logging routing to %s\n",getenv("ROUTE_TRACE"));
     }
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
+    /* PIN_FREEZE=1: NESSUNO scambio di collocazione dopo il load — la disposizione
+     * scelta al boot resta fissa per tutta la sessione (niente re-pin live, niente
+     * seeding-pass sul primo prompt). L'uso continua ad accumularsi in .coli_usage
+     * a ogni turno, e il PROSSIMO load (PIN=auto) carica la nuova disposizione
+     * ottima: si serve su un layout stabile e si ottimizza tra un boot e l'altro. */
+    g_pin_freeze = getenv("PIN_FREEZE")?atoi(getenv("PIN_FREEZE")):0;
+    if(g_pin_freeze){
+        if(g_repin>0) fprintf(stderr,"[PIN] freeze: REPIN=%d ignored (placement fixed after load)\n",g_repin);
+        g_repin=0;
+        fprintf(stderr,"[PIN] freeze: placement fixed for this session; usage keeps accumulating for the next boot's PIN=auto\n");
+    }
     g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
     if(getenv("PREFILL_CHUNK")) g_prefill_chunk=atoi(getenv("PREFILL_CHUNK"));
     g_dsa_force = getenv("DSA_FORCE")?atoi(getenv("DSA_FORCE")):0;
@@ -6196,7 +6208,7 @@ int main(int argc, char **argv){
     const char *cuda_expert=getenv("CUDA_EXPERT_GB");
     g_cuda_expert_auto=cuda_expert&&!strcmp(cuda_expert,"auto");
     g_cuda_expert_gb=cuda_expert&&!g_cuda_expert_auto?atof(cuda_expert):0;
-    if(!getenv("REPIN")&&g_cuda_expert_auto&&getenv("PIN_GB")&&
+    if(!g_pin_freeze&&!getenv("REPIN")&&g_cuda_expert_auto&&getenv("PIN_GB")&&
        !strcmp(getenv("PIN_GB"),"all")) g_repin=16;
     g_cuda_release_host=getenv("CUDA_RELEASE_HOST")?atoi(getenv("CUDA_RELEASE_HOST")):(g_cuda_ndev>1);
     if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) requires COLI_CUDA=1\n"); return 2; }

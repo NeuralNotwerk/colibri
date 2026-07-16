@@ -52,7 +52,8 @@ Format: `VAR` — default — effect.
 | `PIN` | unset | Path to a `.coli_usage`/stats file; pins the hottest experts into a resident "hot store" at startup. **`PIN=auto`** seeds from the model dir's live `.coli_usage` (appended after every turn, so each restart's pin placement follows the accumulated real workload) with `stats.txt` as the fallback for a virgin model dir; neither present → no pin this run. |
 | `PIN_GB` | `10.0` | Size budget (GB) for the pinned hot store when `PIN` is set. |
 | `AUTOPIN` | `1` (on) | Auto-pin the hot store from usage history once ≥5000 selections are recorded. |
-| `REPIN` | `0` (off) | Live re-pin the hot store every N emitted tokens (RFC). |
+| `REPIN` | `0` (off; auto-16 with `PIN_GB=all`+expert-auto) | Live re-pin the hot store every N emitted tokens (RFC). |
+| `PIN_FREEZE` | `0` (off) | **Freeze the expert placement after load**: no live re-pin, no first-prompt seeding pass — the boot arrangement stays fixed for the whole session. Usage still accumulates in `.coli_usage` every turn, so the *next* boot's `PIN=auto` loads the new optimum. Serve on a stable layout, optimize between boots. Overrides `REPIN`. |
 | `PILOT` | `0` (off) | Router-piloted cross-layer expert prefetch. |
 | `PILOT_REAL` | `0` (off) | Value-preserving real cross-layer prefetch loads (`PILOT_REAL=1` opts in). |
 | `PILOT_K` | `6` if `PILOT_REAL` else `8` | Number of experts the pilot prefetches per step. |
