@@ -419,7 +419,9 @@ __global__ static void attention_absorb_stream_kernel8(float *ctx,const float *q
         const uint8_t *latent,const float *lsc,const uint8_t *rope,const float *rsc,
         const void *weights,const float *wscale,
         int fmt,int S,int H,int Q,int R,int V,int K,int T,float scale){
-    int s=blockIdx.y,h=blockIdx.x,tid=threadIdx.x,nt=T-S+s+1,rbase=h*(Q+V);
+    /* S su grid-X (limite 2^31): con S in grid-Y i prefill oltre 65535 righe
+       fallivano il lancio (grid-Y max 65535) e cadevano silenziosamente su CPU. */
+    int s=blockIdx.x,h=blockIdx.y,tid=threadIdx.x,nt=T-S+s+1,rbase=h*(Q+V);
     if(s>=S||nt<1)return;
     extern __shared__ float sm[];
     float *qa=sm,*cl=qa+K,*tsc=cl+K,*tls=tsc+COLI_ATTN_TILE,*red=tls+COLI_ATTN_TILE;
@@ -1083,7 +1085,7 @@ static int attention_absorb_batch_run8(ColiCudaTensor *w,ColiCudaTensor *proj,fl
             w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
     } else {                                   /* oltre il tetto smem: softmax online a tessere */
         size_t shared=(size_t)(2*K+2*COLI_ATTN_TILE+256)*sizeof(float);
-        attention_absorb_stream_kernel8<<<dim3(H,S),256,shared,dc->stream>>>(dc->ac,dc->aq,
+        attention_absorb_stream_kernel8<<<dim3(S,H),256,shared,dc->stream>>>(dc->ac,dc->aq,
             (const uint8_t*)dc->al,dc->alsc,(const uint8_t*)dc->ar,dc->arsc,
             w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
     }
@@ -1179,7 +1181,7 @@ extern "C" int coli_cuda_attention_project_batch_kvdev8(ColiCudaTensor *w,ColiCu
             latent_dev,lsc_dev,rope_dev,rsc_dev,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
     } else {
         size_t shared=(size_t)(2*K+2*COLI_ATTN_TILE+256)*sizeof(float);
-        attention_absorb_stream_kernel8<<<dim3(H,S),256,shared,dc->stream>>>(dc->ac,dc->aq,
+        attention_absorb_stream_kernel8<<<dim3(S,H),256,shared,dc->stream>>>(dc->ac,dc->aq,
             latent_dev,lsc_dev,rope_dev,rsc_dev,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
     }
     if(!cuda_ok(cudaGetLastError(),"kvdev8 batch launch"))return 0;

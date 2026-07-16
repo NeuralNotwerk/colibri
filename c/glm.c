@@ -4039,6 +4039,23 @@ static float *step_all(Model *m, const int *ids, int S, int pos_base){
     free(x); free(row); return lo;
 }
 
+/* Prefill in BLOCCHI: attivazioni e scratch GPU (matmul densi, attention batch)
+ * scalano con S — a 124k righe solo il buffer q vale ~8 GB e in prod gli OOM
+ * a catena disabilitavano i tensori densi (2026-07-16). Il math per-token e'
+ * IDENTICO (causale sulla stessa KV, i blocchi successivi vedono i precedenti);
+ * cambia solo la granularita' di batch, stessa classe di varianza fp dei kernel
+ * S-dipendenti (#100). Il pair MTP a cavallo di due blocchi non viene assorbito
+ * (una riga di draft-KV stantia per confine: i draft restano verificati).
+ * PREFILL_CHUNK=0 disattiva, default 8192. */
+static int g_prefill_chunk=8192;
+static float *step_prefill(Model *m, const int *ids, int S, int pos_base){
+    int ch=g_prefill_chunk;
+    if(ch<=0 || S<=ch) return step(m,ids,S,pos_base);
+    int off=0;
+    while(S-off>ch){ free(step(m,ids+off,ch,pos_base+off)); off+=ch; }
+    return step(m,ids+off,S-off,pos_base+off);
+}
+
 /* One decode token from each independent sequence, evaluated as a single MoE
  * batch.  Prefill and speculative batches retain their contiguous-KV path. */
 static float *step_decode_batch(Model *m, const DecodeRow *rows, int S){
@@ -4523,7 +4540,7 @@ static void run_score(Model *m, const char *snap, const char *path){
 static void generate(Model *m, const int *prompt, int np, int n_new, int *out){
     kv_alloc(m,np+n_new+g_draft+2);
     for(int i=0;i<np;i++) out[i]=prompt[i];
-    float *logit=step(m,prompt,np,0);
+    float *logit=step_prefill(m,prompt,np,0);
     EmitStore es={out+np,0};
     spec_decode(m,out,np,n_new,-1,logit,emit_store,&es,NULL);
 }
@@ -4593,7 +4610,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     kv_alloc(m, np+ngen+g_draft+2);
     int *all=malloc((np+ngen+g_draft+2)*sizeof(int)); memcpy(all,pids,np*sizeof(int));
     double prefill_t=now_s();
-    float *logit=step(m,pids,np,0);
+    float *logit=step_prefill(m,pids,np,0);
     if(g_repin>0){
         m->n_emit=(uint64_t)g_repin;
         int limit=32;
@@ -5081,7 +5098,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
     if(add>0) memcpy(sc->hist+sc->len,tmp+sc->len,(size_t)add*sizeof(int));
     fprintf(stderr,"[API] KV slot %d prefix %d/%d token, prefill %d\n",sub.slot,sc->len,nt,add);
     free(tmp);
-    float *logit = add>0 ? step(m,sc->hist+sc->len,add,sc->len)
+    float *logit = add>0 ? step_prefill(m,sc->hist+sc->len,add,sc->len)
                          : step(m,sc->hist+sc->len-1,1,sc->len-1);
     sc->len+=add; sc->first=0;
     ServeReq *r=&req[sub.slot]; memset(r,0,sizeof(*r));
@@ -5324,7 +5341,7 @@ static void run_serve(Model *m, const char *snap){
         uint64_t kln0=m->route_kl_n; double kls0=m->route_kl_sum;
         double tt0=now_s();
         float *logit;
-        if(k>0){ logit=step(m,hist+len,k,len); len+=k; }
+        if(k>0){ logit=step_prefill(m,hist+len,k,len); len+=k; }
         else logit=step(m,hist+len-1,1,len-1);   /* prompt identico/prefisso: rigenera i logits */
         EmitStream es={&T,m,now_s(),0,1};
         int prod=0;
@@ -6082,6 +6099,7 @@ int main(int argc, char **argv){
     }
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
     g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
+    if(getenv("PREFILL_CHUNK")) g_prefill_chunk=atoi(getenv("PREFILL_CHUNK"));
     g_dsa_force = getenv("DSA_FORCE")?atoi(getenv("DSA_FORCE")):0;
     /* matmul_qt documenta la soglia int4-IDOT come "configurabile con I4S" ma il getenv non
      * c'era: la variabile non aveva alcun effetto. I4S=<n> -> IDOT int4 solo per S>=n.
