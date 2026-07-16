@@ -2193,6 +2193,12 @@ static int g_absorb=-1;
  * Coperti CPU e CUDA (kernel absorb8); auto-off sotto COLI_METAL, e forza
  * COLI_CUDA_PIPE=0 (l'ombra KV su device e il pipe-prefill leggono righe f32). */
 static int g_kv8=0;
+/* Ombra fp8 residente su device. Paga solo dove il decode passa dall'attention
+ * CUDA contigua (kvs==NULL): con piu' slot KV il decode mux e' ragged -> sempre
+ * CPU, e l'ombra costerebbe ~max_t*(kvl+R+8) byte per layer di VRAM senza
+ * rendere nulla (il prefill carica gli stessi byte in entrambi i casi).
+ * AUTO: accesa solo con KV_SLOTS==1. KV_SHADOW=0/1 forza. */
+static int g_kv_shadow=0;
 #ifdef COLI_CUDA
 static int g_cuda_pipe=0;   /* COLI_CUDA_PIPE=1: prefill attention chain resident on the layer home device */
 #endif   /* ABSORB: -1 auto (decode S<=4), 0 mai, 1 sempre (test) */
@@ -2233,7 +2239,7 @@ static int kv_dev_sync(Model *m, Layer *l, int layer, int upto){
  * Alloc lazy e fail-soft: senza VRAM si torna al percorso host/CPU. */
 static int kv_dev_sync8(Model *m, Layer *l, int layer, int upto){
     Cfg *c=&m->c; int kvl=c->kv_lora, R=c->qk_rope, dev=l->kv_b.cuda_device;
-    if(upto>m->max_t) return 0;
+    if(!g_kv_shadow || upto>m->max_t) return 0;
     if(!m->kv_dev_L8[layer]){
         m->kv_dev_L8[layer]=(uint8_t*)coli_cuda_pipe_alloc(dev,(size_t)m->max_t*kvl);
         m->kv_dev_R8[layer]=(uint8_t*)coli_cuda_pipe_alloc(dev,(size_t)m->max_t*R);
@@ -2241,7 +2247,17 @@ static int kv_dev_sync8(Model *m, Layer *l, int layer, int upto){
         m->kv_dev_Rs[layer]=(float*)coli_cuda_pipe_alloc(dev,(size_t)m->max_t*4);
         m->kv_dev_valid[layer]=0;
         if(!m->kv_dev_L8[layer]||!m->kv_dev_R8[layer]||
-           !m->kv_dev_Ls[layer]||!m->kv_dev_Rs[layer]) return 0;
+           !m->kv_dev_Ls[layer]||!m->kv_dev_Rs[layer]){
+            /* alloc PARZIALE: senza pulizia la prossima chiamata vedrebbe L8 valido
+             * e caricherebbe su buffer di scala NULL. Libera e azzera tutto. */
+            if(m->kv_dev_L8[layer]) coli_cuda_pipe_free(dev,m->kv_dev_L8[layer]);
+            if(m->kv_dev_R8[layer]) coli_cuda_pipe_free(dev,m->kv_dev_R8[layer]);
+            if(m->kv_dev_Ls[layer]) coli_cuda_pipe_free(dev,m->kv_dev_Ls[layer]);
+            if(m->kv_dev_Rs[layer]) coli_cuda_pipe_free(dev,m->kv_dev_Rs[layer]);
+            m->kv_dev_L8[layer]=NULL; m->kv_dev_R8[layer]=NULL;
+            m->kv_dev_Ls[layer]=NULL; m->kv_dev_Rs[layer]=NULL;
+            return 0;
+        }
     }
     int v=m->kv_dev_valid[layer];
     if(v<upto){
@@ -5689,10 +5705,22 @@ static void pin_load(Model *m, const char *statspath, double gb){
     double remaining[COLI_CUDA_MAX_DEVICES]={0}, placed_b[COLI_CUDA_MAX_DEVICES]={0};
     int placed_n[COLI_CUDA_MAX_DEVICES]={0}, gpu_prefix=0;
     double budget=g_cuda_expert_gb*1e9, safe_total=0;
+    /* KV8: l'ombra fp8 si alloca LAZY sul device di kv_b DOPO questo conto — va
+     * proiettata come la densa, o l'auto-budget la mangia e al primo prefill i
+     * tensori densi vanno in OOM->CPU (visto in prod 2026-07-16: ~150 MB/layer
+     * a 256k sfondavano la riserva fissa da 2 GB/device). */
+    double shadow_proj[COLI_CUDA_MAX_DEVICES]={0};
+    if(g_kv_shadow&&g_cuda_enabled&&getenv("COLI_CUDA_ATTN")&&atoi(getenv("COLI_CUDA_ATTN"))){
+        int est_ctx=getenv("CTX")?atoi(getenv("CTX")):4096;   /* stesso default di run_serve */
+        double per_layer=(double)est_ctx*(m->c.kv_lora+m->c.qk_rope+8);
+        for(int i=0;i<m->c.n_layers;i++) if(m->L[i].kv_b.cuda_eligible)
+            for(int d=0;d<g_cuda_ndev;d++)
+                if(g_cuda_devices[d]==m->L[i].kv_b.cuda_device){ shadow_proj[d]+=per_layer; break; }
+    }
     if(g_cuda_enabled&&(g_cuda_expert_gb>0||g_cuda_expert_auto)) for(int i=0;i<g_cuda_ndev;i++){
         size_t free_b=0,total_b=0;
         if(coli_cuda_mem_info(g_cuda_devices[i],&free_b,&total_b)){
-            remaining[i]=(double)free_b-(double)g_cuda_dense_projected[i]-2e9;
+            remaining[i]=(double)free_b-(double)g_cuda_dense_projected[i]-shadow_proj[i]-2e9;
             if(remaining[i]<0) remaining[i]=0; safe_total+=remaining[i];
         }
     }
@@ -6118,7 +6146,11 @@ int main(int argc, char **argv){
 #endif
         if(g_kv8){
             coli_fp8_lut_init();
-            fprintf(stderr,"[KV8] latent KV cache in fp8 e4m3 + per-row scale (~3.9x less KV RAM)\n");
+            g_kv_shadow = getenv("KV_SHADOW") ? atoi(getenv("KV_SHADOW"))
+                                              : kv_slot_count()==1;
+            fprintf(stderr,"[KV8] latent KV cache in fp8 e4m3 + per-row scale (~3.9x less KV RAM); "
+                "device shadow %s\n", g_kv_shadow?"ON":
+                "off (multi-slot decode is ragged/CPU: the shadow would cost VRAM for nothing)");
         }
     }
     printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
