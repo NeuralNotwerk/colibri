@@ -2216,6 +2216,28 @@ static int g_cuda_pipe=0;   /* COLI_CUDA_PIPE=1: prefill attention chain residen
 static int g_dsa_force=0; /* DSA_FORCE=1: selezione sempre attiva (test: top-min(k,T)=denso) */
 static int cmp_fdesc(const void *a,const void *b){
     float x=*(const float*)a, y=*(const float*)b; return x<y?1:x>y?-1:0; }
+/* k-esimo valore PIU' GRANDE in O(n) (quickselect, mediana-di-3): la soglia
+ * del top-k DSA usava un qsort COMPLETO della storia per riga — al decode
+ * lungo sono ~T log T confronti per token per layer indexer, e nel prefill
+ * la parete O(T^2 log T) misurata sul prompt da 124k. Stessa soglia, stesso
+ * output (il chiamante ri-scansiona per posizione con > e ==). */
+static float kth_largest(float *a, int n, int k){
+    int lo=0, hi=n-1, kk=k-1;                       /* kk: indice in ordine DESC */
+    while(lo<hi){
+        int mid=lo+(hi-lo)/2;
+        float p3[3]={a[lo],a[mid],a[hi]};
+        float p = p3[0]>p3[1] ? (p3[1]>p3[2]?p3[1]:(p3[0]>p3[2]?p3[2]:p3[0]))
+                              : (p3[0]>p3[2]?p3[0]:(p3[1]>p3[2]?p3[2]:p3[1]));
+        int i=lo, j=hi;
+        while(i<=j){
+            while(a[i]>p) i++;
+            while(a[j]<p) j--;
+            if(i<=j){ float t=a[i]; a[i]=a[j]; a[j]=t; i++; j--; }
+        }
+        if(kk<=j) hi=j; else if(kk>=i) lo=i; else return a[kk];
+    }
+    return a[kk];
+}
 
 /* attenzione MLA con KV-cache compressa, su token nuovi x[S,hidden], pos_base = pos del primo */
 /* kvs/pos describe a ragged decode batch: each row may belong to a different
@@ -2510,6 +2532,17 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * dai layer SHARED successivi). Selezione attiva solo con contesto > index_topk
      * (o DSA_FORCE=1 per il test: selezionare TUTTO deve dare l'output denso esatto). */
     const int *dsel=NULL, *dnsel=NULL; int dtopk=0;
+    int cuda_absorb=0;
+#ifdef COLI_CUDA
+    cuda_absorb=layer<c->n_layers&&!kvs&&g_cuda_enabled&&getenv("COLI_CUDA_ATTN")&&
+                atoi(getenv("COLI_CUDA_ATTN"))&&c->kv_lora<=512;
+#endif
+    /* La SELEZIONE (scan indexer + soglia top-k per riga) si calcola solo se
+     * qualcuno la consumera': i rami batch GPU del prefill attendono DENSO e la
+     * ignorano — calcolarla comunque era la parete quadratica del prompt lungo
+     * (l'output NON cambia: cambia solo il lavoro sprecato). Le CHIAVI indexer
+     * (Ic) si scrivono SEMPRE: servono al decode futuro. */
+    int want_sel = !(cuda_absorb && S>4);
     if(m->has_dsa && layer<c->n_layers && ((!kvs && m->kv_start[layer]==0) || kvs)){
         int nh=c->index_nh, hd=c->index_hd; dtopk=c->index_topk;
         if(c->idx_type[layer]){
@@ -2530,6 +2563,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 rope_interleave(kd, pos, c);                 /* primi qk_rope dim, interleaved */
             }
             free(KD);
+            if(want_sel){
             if((int64_t)S*dtopk > m->dsa_scap){
                 free(m->dsa_sel); free(m->dsa_nsel);
                 m->dsa_scap=(int64_t)S*dtopk;
@@ -2559,18 +2593,18 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                     }
                     isc[t]=a*wsc;
                 }
-                /* top-keep: soglia via qsort desc, poi scan in ordine di posizione */
+                /* top-keep: soglia via quickselect O(nk), poi scan in ordine di posizione */
                 float *tmp=falloc(nk); memcpy(tmp,isc,nk*sizeof(float));
-                qsort(tmp,nk,sizeof(float),cmp_fdesc);
-                float thr=tmp[keep-1];
+                float thr=kth_largest(tmp,nk,keep);
                 int *dst=m->dsa_sel+(int64_t)s*dtopk, nd=0;
                 for(int t=0;t<nk && nd<keep;t++) if(isc[t]>thr) dst[nd++]=t;
                 for(int t=0;t<nk && nd<keep;t++) if(isc[t]==thr) dst[nd++]=t;
                 m->dsa_nsel[s]=nd;
                 free(qi); free(w32); free(isc); free(tmp);
             }
+            }
         }
-        if(m->dsa_nsel){ dsel=m->dsa_sel; dnsel=m->dsa_nsel; }
+        if(want_sel && m->dsa_nsel){ dsel=m->dsa_sel; dnsel=m->dsa_nsel; }
     }
     /* WEIGHT ABSORPTION (DeepSeek): per S piccoli (decode/verifica MTP) NON si ricostruisce
      * k/v per ogni token del contesto. Per linearita':
@@ -2581,11 +2615,6 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         m->t_attn += now_s()-ta0;
         return;
     }
-    int cuda_absorb=0;
-#ifdef COLI_CUDA
-    cuda_absorb=layer<c->n_layers&&!kvs&&g_cuda_enabled&&getenv("COLI_CUDA_ATTN")&&
-                atoi(getenv("COLI_CUDA_ATTN"))&&c->kv_lora<=512;
-#endif
     int absorb = kvs || g_absorb==1 || (g_absorb<0 && S<=4) || cuda_absorb;
     if(absorb && c->kv_lora<=512){
         m->t_aproj+=now_s()-ta0; double tac=now_s();
