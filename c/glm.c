@@ -2607,12 +2607,14 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         float *sc_all = falloc((int64_t)omp_get_max_threads()*sc_cap);
         int cuda_core=0,cuda_projected=0;
 #ifdef COLI_CUDA
-        /* KV8: se la selezione DSA e' attiva per QUALCHE riga, i rami batch (che
-         * attendono DENSO su tutte le chiavi) vanno saltati: il ramo S<=4 sotto ha
-         * il kernel gather e rispetta la selezione, come il percorso CPU. Il flusso
-         * f32 resta INVARIATO (il denso-su-selezione e' il comportamento storico). */
+        /* KV8 + selezione DSA: per il DECODE (S<=4) i rami batch densi vanno
+         * saltati — il ramo per-riga sotto ha il kernel gather e rispetta la
+         * selezione come il percorso CPU. Per il PREFILL invece si tiene la
+         * semantica storica di f32 (denso su GPU ignorando la selezione):
+         * il percorso fedele-sparso su CPU costa O(T^2 log T) di qsort
+         * dell'indexer — misurato ~8 ORE per un prompt da 124k (2026-07-16). */
         int sel_any=0;
-        if(g_kv8&&dnsel) for(int s2=0;s2<S;s2++) if(dnsel[s2]>0){sel_any=1;break;}
+        if(g_kv8&&S<=4&&dnsel) for(int s2=0;s2<S;s2++) if(dnsel[s2]>0){sel_any=1;break;}
         if(cuda_absorb&&!sel_any&&l->n_kv_b_shard>1){
             int n=l->n_kv_b_shard,st0=m->kv_start[layer],nt=pos_base+S-st0,ok=1;
             float *qs=falloc((int64_t)S*H*qh),*cs=falloc((int64_t)S*H*vh);
@@ -6210,16 +6212,16 @@ int main(int argc, char **argv){
 #endif
         if(g_kv8){
             coli_fp8_lut_init();
-            /* AUTO: e' il MUX multi-slot (SERVE_BATCH) ad avere il decode ragged
-             * (step_decode_batch -> sempre CPU); run_serve semplice decodifica
-             * contiguo anche con piu' slot e l'ombra li' PAGA. Non basta contare
-             * gli slot: conta CHI decodifica. */
-            int mux = getenv("SERVE") && getenv("SERVE_BATCH") && atoi(getenv("SERVE_BATCH"));
-            g_kv_shadow = getenv("KV_SHADOW") ? atoi(getenv("KV_SHADOW"))
-                                              : !(mux && kv_slot_count()>1);
+            /* AUTO: sempre accesa sotto CUDA. Col prefill a blocchi l'ombra e'
+             * cio' che evita di ri-caricare l'INTERA storia fp8 per ogni layer di
+             * ogni blocco (~170 GB di PCIe su un prompt da 124k, misurato): ogni
+             * riga sale una volta sola. Il decode mux ragged non la usa, ma il
+             * prefill si'; il budget auto la proietta e il pavimento da 1.5 GB
+             * in kv_dev_sync8 protegge i casi che la proiezione non vede.
+             * KV_SHADOW=0/1 forza. */
+            g_kv_shadow = getenv("KV_SHADOW") ? atoi(getenv("KV_SHADOW")) : 1;
             fprintf(stderr,"[KV8] latent KV cache in fp8 e4m3 + per-row scale (~3.9x less KV RAM); "
-                "device shadow %s\n", g_kv_shadow?"ON":
-                "off (multi-slot mux decode is ragged/CPU: the shadow would cost VRAM for nothing)");
+                "device shadow %s\n", g_kv_shadow?"ON":"off (KV_SHADOW=0)");
         }
     }
     printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
