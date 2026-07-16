@@ -1,5 +1,5 @@
 /* .coli_kv round-trip: v1 (f32) and v2 (KV8 fp8+scale) records, the v1->v2
- * upgrade path (quantize-on-load, file removed so the next save rewrites it
+ * upgrade path (quantize-on-load; the v1 file survives until the first save rewrites it
  * as v2), the v2-under-f32 reject, and the format-mismatch self-heal in
  * kv_disk_append (magic differs -> file rewritten from record 0). No model
  * file needed: the disk paths only read c->n_layers/kv_lora/qk_rope/vocab. */
@@ -39,6 +39,7 @@ int main(void){
 
     /* ---- v1 file + KV8: quantize-on-load; il file v1 resta INTATTO (un crash
      * prima del primo save non deve perdere la conversazione) ---- */
+    if(m.kv->disk_fp){ fclose(m.kv->disk_fp); m.kv->disk_fp=NULL; }  /* "riavvio" del processo */
     g_kv8=1; kv_alloc(&m,16); m.kv->disk_nrec=0;
     CHECK(kv_disk_load(&m,hist2,16)==NP, "v1->kv8 load");
     CHECK(m.kv->disk_nrec==0, "v1->kv8 leaves disk_nrec=0 for the full rewrite");
@@ -75,6 +76,7 @@ int main(void){
     }
 
     /* ---- v2 sotto f32: si riparte da zero, il file NON va creduto ---- */
+    if(m.kv->disk_fp){ fclose(m.kv->disk_fp); m.kv->disk_fp=NULL; }  /* "riavvio" del processo */
     g_kv8=0; kv_alloc(&m,16); m.kv->disk_nrec=0;
     CHECK(kv_disk_load(&m,hist2,16)==0, "v2 under f32 must be rejected");
 
@@ -83,6 +85,7 @@ int main(void){
         for(int j=0;j<m.c.kv_lora;j++) m.Lc[i][(int64_t)p*m.c.kv_lora+j]=fill(i,p,j);
         for(int j=0;j<m.c.qk_rope;j++) m.Rc[i][(int64_t)p*m.c.qk_rope+j]=fill(i+9,p,j);
     }
+    if(m.kv->disk_fp){ fclose(m.kv->disk_fp); m.kv->disk_fp=NULL; }  /* "riavvio" del processo */
     m.kv->disk_nrec=3;                              /* stantio: la magic v2 lo invalida */
     kv_disk_append(&m,hist,NP);
     { FILE *f=fopen(PATH,"rb"); char mg[8]={0};

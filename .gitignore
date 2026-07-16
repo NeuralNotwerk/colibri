@@ -73,3 +73,4 @@ c/tests/test_kv_fp8
 c/tests/test_kv_fp8.exe
 c/tests/test_kv_disk
 c/tests/test_kv_disk.exe
+c/tests/test_uring

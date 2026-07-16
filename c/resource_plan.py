@@ -167,6 +167,30 @@ def discover_gpus():
 
 
 def physical_cpu_count():
+    if sys.platform == "win32":
+        # os.cpu_count() conta i processori logici (SMT): 2 thread/core saturano
+        # le unita' AVX-512 e peggiorano il matmul. Contiamo i core fisici veri
+        # con GetLogicalProcessorInformationEx(RelationProcessorCore).
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            need = ctypes.c_ulong(0)
+            k32.GetLogicalProcessorInformationEx(0, None, ctypes.byref(need))
+            buf = (ctypes.c_char * need.value)()
+            if k32.GetLogicalProcessorInformationEx(0, buf, ctypes.byref(need)):
+                raw, cores, off = bytes(buf), 0, 0
+                while off + 8 <= need.value:
+                    relationship = int.from_bytes(raw[off:off + 4], "little")
+                    size = int.from_bytes(raw[off + 4:off + 8], "little")
+                    if size <= 0:
+                        break
+                    if relationship == 0:  # RelationProcessorCore
+                        cores += 1
+                    off += size
+                if cores:
+                    return cores
+        except (OSError, ValueError, AttributeError):
+            pass
     try:
         result = subprocess.run(["lscpu", "-p=core,socket"], text=True,
                                 capture_output=True, check=True, timeout=5)
@@ -289,8 +313,11 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
     result = dict(env or {})
     result.setdefault("COLI_POLICY", plan["policy"]["name"])
     result.setdefault("OMP_NUM_THREADS", str(plan["cpu"]["physical_cores"]))
-    result.setdefault("OMP_PROC_BIND", "spread")
-    result.setdefault("OMP_PLACES", "cores")
+    if sys.platform != "win32":
+        # la libgomp di MinGW non supporta l'affinity su Windows
+        # ("Affinity not supported on this configuration"): non impostarle li'.
+        result.setdefault("OMP_PROC_BIND", "spread")
+        result.setdefault("OMP_PLACES", "cores")
     if plan["policy"]["name"] == "balanced":
         result.setdefault("REPIN", "64")
     ram = plan["tiers"]["ram"]

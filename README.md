@@ -48,9 +48,9 @@ brightness is routing heat, and every expert routed in a turn flashes white. Hov
 A 744B Mixture-of-Experts model activates only ~40B parameters per token — and only ~11 GB of those change from token to token (the routed experts). So:
 
 - the **dense part** (attention, shared experts, embeddings — ~17B params) stays **resident in RAM at int4** (~9.9 GB);
-- the **21,504 routed experts** (75 MoE layers × 256 experts + the MTP head, ~19 MB each at int4) live **on disk** (~370 GB) and are **streamed on demand**, with a per-layer LRU cache, an optional pinned hot-store, and the OS page cache as a free L2.
+- the **19,456 routed experts** (75 MoE layers × 256 experts + the MTP head, ~19 MB each at int4) live **on disk** (~370 GB) and are **streamed on demand**, with a per-layer LRU cache, an optional pinned hot-store, and the OS page cache as a free L2.
 
-The engine is a single C file (`c/glm.c`, ~2,400 lines) plus small headers. No BLAS, no Python at runtime, no GPU required (an opt-in CUDA tier for pinned experts exists — see below).
+The engine is a single C file (`c/glm.c`) plus small headers. No BLAS, no Python at runtime, no GPU required (an opt-in CUDA tier for pinned experts exists — see below).
 
 ## What's implemented
 
@@ -456,8 +456,8 @@ CUDA, CPU hot-store, and CUDA hot-expert execution with identical replay tokens.
 
 ### Web interface
 
-`web/` contains a community-contributed browser UI (React + TypeScript, ~390
-lines of source, a pure API client — it never touches the engine directly):
+`web/` contains a community-contributed browser UI (React + TypeScript, a pure
+API client — it never touches the engine directly):
 
 ```bash
 cd web
@@ -469,7 +469,7 @@ works against the colibrì OpenAI-compatible server (in review, #21) or any othe
 compatible endpoint. Nothing leaves the endpoint you configure. The terminal
 `coli chat` remains the first-class interface.
 
-Useful knobs (env or flags): `--temp T` token sampling temperature (default 0.7 + nucleus 0.90 — tuned for int4; 0 = greedy), `--topp 0.7` adaptive expert top-p (30–40% less disk), `--ngen N` max tokens per answer (`:more` in chat continues a truncated one), `--repin N` adapt RAM/VRAM hot experts every N emitted tokens, `AUTOPIN=0` disable the learning cache's auto-pin, `THINK=1` enable GLM-5.2's reasoning block, `DRAFT=n` MTP draft depth, `GRAMMAR=g.gbnf` grammar-forced drafts for constrained JSON/NDJSON output (`GRAMMAR_DRAFT=n` caps the forced span), `TF=1` teacher-forcing validation, `PILOT=1` router-lookahead disk prefetch (experimental — see below), `CAP_RAISE=0` don't auto-grow the expert cache.
+Useful knobs (env or flags): `--temp T` token sampling temperature (default 0.7 + nucleus 0.90 — tuned for int4; 0 = greedy), `--topp 0.7` adaptive expert top-p (30–40% less disk), `--ngen N` max tokens per answer (`:more` in chat continues a truncated one), `--repin N` adapt RAM/VRAM hot experts every N emitted tokens, `AUTOPIN=0` disable the learning cache's auto-pin, `THINK=1` enable GLM-5.2's reasoning block, `DRAFT=n` MTP draft depth, `GRAMMAR=g.gbnf` grammar-forced drafts for constrained JSON/NDJSON output (`GRAMMAR_DRAFT=n` caps the forced span), `TF=1` teacher-forcing validation, `PILOT=1` router-lookahead disk prefetch (experimental — see below), `URING=1` Linux-only batched expert I/O (implies `PIPE=1`; also batches `PILOT_REAL`), `PIPE=0` disable the async expert-load pool (**default ON on Windows** — overlaps expert `pread` with the matmul so the CPU isn't idle waiting on the SSD; measured −18% disk service time), `RAM_GB=<n>` claim more RAM for the expert cache than the conservative auto-detect (e.g. `RAM_GB=31` on a 32 GB host raises the cache cap and hit rate measurably), `CAP_RAISE=0` don't auto-grow the expert cache.
 
 ### Resource policy
 
@@ -494,10 +494,10 @@ Disk is an immutable recovery source, not a normal decode target. If the plan
 leaves cold expert bytes on disk, speed depends on cache hit rate; output
 quality does not.
 
-Cold expert reads use a deferred pipeline: resident RAM/VRAM experts execute
+Cold expert reads can use a deferred pipeline: resident RAM/VRAM experts execute
 while missing experts are loaded in a bounded background I/O pool, then the
-cold results join before the layer completes. `IO_THREADS=n` overrides the
-default eight loader threads when foreground work exists. Profiling reports
+cold results join before the layer completes. The pool engages only under
+`PIPE=1`; `PIPE_WORKERS=n` sets its worker count (default 8). Profiling reports
 both disk service time and the smaller foreground-visible wait time so overlap
 is explicit rather than credited as unexplained speedup.
 
@@ -658,6 +658,7 @@ c/
 ├── scripts/              long-running conversion helpers
 └── tests/                dependency-free C and Python tests
 web/                      browser UI (pure OpenAI-API client, community-maintained)
+desktop/                  Tauri v2 desktop shell wrapping the web UI
 ```
 
 The runtime path intentionally stays flat and readable: `glm.c` plus its small
