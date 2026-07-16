@@ -2241,6 +2241,15 @@ static int kv_dev_sync8(Model *m, Layer *l, int layer, int upto){
     Cfg *c=&m->c; int kvl=c->kv_lora, R=c->qk_rope, dev=l->kv_b.cuda_device;
     if(!g_kv_shadow || upto>m->max_t) return 0;
     if(!m->kv_dev_L8[layer]){
+        /* Guardia al punto d'allocazione (vale per OGNI modalita', anche PROMPT
+         * dove max_t segue il prompt e non CTX e la proiezione di pin_load non
+         * puo' saperlo): l'ombra si prende solo se al device restano >=1.5 GB
+         * DOPO — altrimenti meglio l'upload per-chiamata che affamare densa e
+         * scratch (OOM->CPU visto in prod 2026-07-16). */
+        size_t free_b=0,total_b=0;
+        double need=(double)m->max_t*(kvl+R+8);
+        if(!coli_cuda_mem_info(dev,&free_b,&total_b) ||
+           (double)free_b < need+1.5e9) return 0;
         m->kv_dev_L8[layer]=(uint8_t*)coli_cuda_pipe_alloc(dev,(size_t)m->max_t*kvl);
         m->kv_dev_R8[layer]=(uint8_t*)coli_cuda_pipe_alloc(dev,(size_t)m->max_t*R);
         m->kv_dev_Ls[layer]=(float*)coli_cuda_pipe_alloc(dev,(size_t)m->max_t*4);
@@ -6146,11 +6155,16 @@ int main(int argc, char **argv){
 #endif
         if(g_kv8){
             coli_fp8_lut_init();
+            /* AUTO: e' il MUX multi-slot (SERVE_BATCH) ad avere il decode ragged
+             * (step_decode_batch -> sempre CPU); run_serve semplice decodifica
+             * contiguo anche con piu' slot e l'ombra li' PAGA. Non basta contare
+             * gli slot: conta CHI decodifica. */
+            int mux = getenv("SERVE") && getenv("SERVE_BATCH") && atoi(getenv("SERVE_BATCH"));
             g_kv_shadow = getenv("KV_SHADOW") ? atoi(getenv("KV_SHADOW"))
-                                              : kv_slot_count()==1;
+                                              : !(mux && kv_slot_count()>1);
             fprintf(stderr,"[KV8] latent KV cache in fp8 e4m3 + per-row scale (~3.9x less KV RAM); "
                 "device shadow %s\n", g_kv_shadow?"ON":
-                "off (multi-slot decode is ragged/CPU: the shadow would cost VRAM for nothing)");
+                "off (multi-slot mux decode is ragged/CPU: the shadow would cost VRAM for nothing)");
         }
     }
     printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
