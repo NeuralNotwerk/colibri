@@ -173,6 +173,11 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor
         int S,int H,int Q,int R,int V,int K,int T,float scale);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_sync(int device);
 
+/* Read-and-clear: last CUDA failure was a transient SCRATCH allocation (VRAM
+ * pressure), so the caller should fall back to CPU for that call only instead
+ * of permanently disabling the weight tensor involved. */
+COLI_CUDA_DLLEXPORT int coli_cuda_scratch_failed(void);
+
 #ifdef __cplusplus
 }
 #endif

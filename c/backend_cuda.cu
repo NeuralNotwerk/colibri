@@ -573,24 +573,31 @@ __global__ static void attention_absorb_sel_kernel8(float *ctx,const float *q,
         for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k);ctx[(size_t)h*V+v]=a*(fmt?wscale[row]:1.f);}
 }
 
+/* OOM di SCRATCH = pressione transitoria di VRAM: il chiamante deve ripiegare
+ * su CPU per QUESTA chiamata senza disabilitare per sempre il tensore dei pesi
+ * (visto in prod 2026-07-16: una cascata di OOM di scratch spegneva i densi
+ * per tutta la sessione). Il flag viene letto-e-azzerato dall'engine. */
+static int g_scratch_failed;
+extern "C" int coli_cuda_scratch_failed(void){ int v=g_scratch_failed; g_scratch_failed=0; return v; }
+
 static int reserve(float **ptr, size_t *cap, size_t bytes) {
     if (*cap >= bytes) return 1;
     if (*ptr) cudaFree(*ptr);
     *ptr = nullptr;
     *cap = 0;
-    if (!cuda_ok(cudaMalloc(ptr, bytes), "scratch allocation")) return 0;
+    if (!cuda_ok(cudaMalloc(ptr, bytes), "scratch allocation")) { g_scratch_failed=1; return 0; }
     *cap = bytes;
     return 1;
 }
 
 static int reserve_bytes(void **ptr,size_t *cap,size_t bytes){
     if(*cap>=bytes) return 1; if(*ptr) cudaFree(*ptr); *ptr=nullptr; *cap=0;
-    if(!cuda_ok(cudaMalloc(ptr,bytes),"descriptor allocation")) return 0; *cap=bytes; return 1;
+    if(!cuda_ok(cudaMalloc(ptr,bytes),"descriptor allocation")){ g_scratch_failed=1; return 0; } *cap=bytes; return 1;
 }
 
 static int reserve_pinned(float **ptr,size_t *cap,size_t bytes){
     if(*cap>=bytes)return 1;if(*ptr)cudaFreeHost(*ptr);*ptr=nullptr;*cap=0;
-    if(!cuda_ok(cudaMallocHost(ptr,bytes),"pinned staging allocation"))return 0;*cap=bytes;return 1;
+    if(!cuda_ok(cudaMallocHost(ptr,bytes),"pinned staging allocation")){ g_scratch_failed=1; return 0; }*cap=bytes;return 1;
 }
 
 extern "C" int coli_cuda_init(const int *devices, int count) {

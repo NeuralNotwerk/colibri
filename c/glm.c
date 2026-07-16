@@ -1000,9 +1000,20 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
         const void *weights = w->fmt==0 ? (const void*)w->qf
                             : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
         if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device)) return;
-        w->cuda_failed=1;
-        fprintf(stderr,"[CUDA] tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",
-            w->O,w->I,w->cuda_device);
+        if(coli_cuda_scratch_failed()){
+            /* OOM di SCRATCH transitorio: la VRAM era piena IN QUESTO momento — il
+             * giro va su CPU ma i pesi restano validi. Disabilitare per sempre il
+             * tensore per un picco di pressione degradava l'intera sessione. */
+            static int warned;
+            if(warned<3 || !(warned&255))
+                fprintf(stderr,"[CUDA] transient scratch OOM (device %d): this call falls back to CPU\n",
+                    w->cuda_device);
+            warned++;
+        } else {
+            w->cuda_failed=1;
+            fprintf(stderr,"[CUDA] tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",
+                w->O,w->I,w->cuda_device);
+        }
     }
 #endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
@@ -4046,8 +4057,8 @@ static float *step_all(Model *m, const int *ids, int S, int pos_base){
  * cambia solo la granularita' di batch, stessa classe di varianza fp dei kernel
  * S-dipendenti (#100). Il pair MTP a cavallo di due blocchi non viene assorbito
  * (una riga di draft-KV stantia per confine: i draft restano verificati).
- * PREFILL_CHUNK=0 disattiva, default 8192. */
-static int g_prefill_chunk=8192;
+ * PREFILL_CHUNK=0 disattiva, default 2048. */
+static int g_prefill_chunk=2048;
 static float *step_prefill(Model *m, const int *ids, int S, int pos_base){
     int ch=g_prefill_chunk;
     if(ch<=0 || S<=ch) return step(m,ids,S,pos_base);
@@ -5755,10 +5766,24 @@ static void pin_load(Model *m, const char *statspath, double gb){
             for(int d=0;d<g_cuda_ndev;d++)
                 if(g_cuda_devices[d]==m->L[i].kv_b.cuda_device){ shadow_proj[d]+=per_layer; break; }
     }
+    /* Scratch di PREFILL: col prefill a blocchi il caso peggiore e' calcolabile —
+     * staging attention (q + ctx), attivazioni dense x/y, buffer del batch-union
+     * expert (righe*topk*inter). Prima questo viveva nella riserva fissa da 2 GB
+     * e a blocchi grandi la sfondava (cascata OOM->CPU, prod 2026-07-16). +25%
+     * per gli extra minori (rope, pesi in staging, logits). */
+    double scratch_proj=0;
+    if(g_cuda_enabled&&g_prefill_chunk>0){
+        Cfg *cc=&m->c;
+        double ch=(double)g_prefill_chunk;
+        double att=ch*cc->n_heads*(cc->qk_head+cc->v_head)*4.0;
+        double dio=ch*(cc->dense_inter>cc->hidden?cc->dense_inter:cc->hidden)*4.0*2;
+        double moe=ch*(cc->topk+cc->n_shared)*cc->moe_inter*4.0*2 + ch*cc->hidden*4.0*2;
+        scratch_proj=(att+dio+moe)*1.25;
+    }
     if(g_cuda_enabled&&(g_cuda_expert_gb>0||g_cuda_expert_auto)) for(int i=0;i<g_cuda_ndev;i++){
         size_t free_b=0,total_b=0;
         if(coli_cuda_mem_info(g_cuda_devices[i],&free_b,&total_b)){
-            remaining[i]=(double)free_b-(double)g_cuda_dense_projected[i]-shadow_proj[i]-2e9;
+            remaining[i]=(double)free_b-(double)g_cuda_dense_projected[i]-shadow_proj[i]-scratch_proj-2e9;
             if(remaining[i]<0) remaining[i]=0; safe_total+=remaining[i];
         }
     }
