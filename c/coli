@@ -344,6 +344,34 @@ class Spinner:
         if self.th: self.th.join(timeout=0.4)
         if TTY: sys.stdout.write("\r\033[K"); sys.stdout.flush()
 
+def engine_diag(p, errlog=None):
+    """Lo stdout del motore ha chiuso: il processo e' morto. Dire PERCHE'.
+    Un SIGKILL dell'OOM-killer del kernel e' altrimenti invisibile — niente errore,
+    niente exit code, il motore muore muto e sembra un bug nostro (issue #305).
+    Quasi sempre e' memoria: il picco reale ha sforato la RAM della macchina."""
+    try: rc=p.wait(timeout=5)
+    except Exception: rc=p.poll()
+    if rc is None:                      why="its output closed but the process is still alive"
+    elif rc<0:                                        # POSIX: morte per segnale
+        try: why=f"killed by {signal.Signals(-rc).name}"
+        except Exception: why=f"killed by signal {-rc}"
+    elif rc>0:                          why=f"exit code {rc}"
+    else:                               why="exited cleanly"
+    print(f"\n  {C.yel}[engine terminated: {why}]{C.r}")
+    if rc is not None and rc<0 and -rc==getattr(signal,"SIGKILL",-1):
+        print(f"  {C.yel}nothing in the engine sends SIGKILL to itself: this is the kernel's\n"
+              f"  OOM-killer. The peak RSS exceeded the machine's free memory.\n"
+              f"  Lower --ram, lower PIN_GB, or shorten the context.{C.r}")
+    if errlog is not None:
+        try:
+            errlog.flush()
+            for _ in range(20):         # il drain thread scrive su errlog quando il child chiude
+                tail=open(errlog.name).read().strip()
+                if tail: break
+                time.sleep(0.05)
+            if tail: print(f"  {C.dgray}" + "\n  ".join(tail.splitlines()[-6:]) + f"{C.r}")
+        except Exception: pass
+
 def stream_turn(p, sentinel, on_bytes):
     """legge fino alla sentinella; on_bytes riceve i chunk della risposta. Poi legge la riga STAT.
     Il PRIMO Ctrl-C durante lo stream non chiude la sessione: il motore (handler SIGINT)
@@ -478,7 +506,9 @@ def cmd_chat(a):
     if st is None:
         try: errlog.write(p.stderr.read().decode("utf-8","replace"))
         except (OSError, ValueError): pass
-        errlog.seek(0); print(errlog.read()[-1500:]); sys.exit("the engine exited while loading")
+        errlog.flush(); errlog.seek(0); print(errlog.read()[-1500:])
+        engine_diag(p)        # perche' e' morto (OOM-kill compreso); errlog e' gia' stampato sopra
+        sys.exit("the engine exited while loading")
     p.stdout.readline()   # TIERS line (web-dashboard protocol): emitted once right after STAT;
                           # left unread it leaks into the first answer's text
     # READY received. Drain the child's stderr into errlog without blocking:
@@ -568,7 +598,7 @@ def cmd_chat(a):
             st=stream_turn(p, END, echo)
             if not raw: md.close()
             sp2.stop()
-            if st is None: print(f"\n  {C.yel}[engine terminated]{C.r}"); break
+            if st is None: engine_diag(p, errlog); break
             el=time.time()-t0
             if st.get("tok"):
                 print(f"\r  {C.dgray}└─ {st['tok']} tok · {st['tps']:.2f} tok/s · hit {st['hit']:.0f}% · RSS {st['rss']:.1f} GB · {el:.0f}s{C.r}")
@@ -631,6 +661,16 @@ def cmd_bench(a):
         print(f"  {C.dim}downloading missing datasets: {', '.join(missing)}{C.r}")
         subprocess.call([py, os.path.join(TOOLS,"fetch_benchmarks.py"),
                          "--out", a.data, "--tasks", ",".join(missing), "--limit", str(max(a.limit,200))])
+        # il fetch riprova da solo (#304), ma se l'hub resta giu' il bench gira sui task
+        # disponibili invece di passare a eval file inesistenti.
+        # EN: the fetch retries on its own (#304), but if the hub stays down the bench
+        # runs on the available tasks instead of handing eval nonexistent files.
+        still=[t for t in tasks.split(",") if not os.path.exists(os.path.join(a.data,f"{t}.jsonl"))]
+        if still:
+            tasks=",".join(t for t in tasks.split(",") if t not in still)
+            print(f"  {C.yel}skipping (download failed, rerun later): {', '.join(still)}{C.r}")
+            if not tasks:
+                print(f"  {C.yel}no datasets available — nothing to bench{C.r}"); sys.exit(1)
     cmd=[py, os.path.join(TOOLS,"eval_glm.py"), "--glm", GLM, "--snap",a.model,
          "--tasks", tasks, "--limit", str(a.limit), "--data", a.data]
     if a.ram: cmd+=["--ram",str(a.ram)]

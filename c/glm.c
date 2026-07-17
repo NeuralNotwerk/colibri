@@ -3061,8 +3061,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
      * only drop from misses. From the misses, keep the highest-aggregate-gate-weight
      * ones up to the budget; drop the rest from idxs[] so they're never loaded.
      * (MoE-Spec arXiv 2602.16052: top-32 of 64 capture 93% routing weight.)
-     * Complementary to TOPP (per-position) — this trims cross-position. */
-    if(g_expert_budget>0 && nu>g_expert_budget){
+     * Complementary to TOPP (per-position) — this trims cross-position.
+     * DECODE-ONLY (S<=4, incl. MTP verify): during prefill S=prompt_len the batch
+     * union nu is 30-100+ experts and capping to 4-8 drops 80-90% of them, each with
+     * non-trivial gate weight -> corrupted prefill hidden state -> wrong KV cache ->
+     * repetitive garbage decode. The budget is only safe token-by-token, where the
+     * prefill KV cache is already correct. (woolcoxm, #292.) */
+    if(g_expert_budget>0 && S<=4 && nu>g_expert_budget){
         /* compute aggregate gate weight per unique expert */
         float *wsum=falloc(nu); for(int j=0;j<nu;j++) wsum[j]=0;
         for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++){
@@ -5977,7 +5982,30 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     double slack = 1.2e9 + pc_b + ws_b + kv_b + kvb_b;
     double avail = ram_gb*1e9 - (double)m->resident_bytes - slack;
     int capmax = (avail>0 && nsp>0) ? (int)(avail/((double)nsp*eb)) : 0;
+    int floored = capmax<1;   /* il budget non regge nemmeno UNO slot per layer */
     if(capmax<1) capmax=1;
+    /* Il floor a 1 e' una bugia comoda: con avail negativo capmax sarebbe 0, cioe'
+     * "non ci sto nel tuo budget". Alzarlo a 1 e proseguire trasforma "non ci sto"
+     * in "sforo" -- ed e' esattamente l'OOM-kill a meta' generazione che questa
+     * funzione esiste per evitare. Il kernel uccide con SIGKILL: nessun errore,
+     * nessun log, il motore muore muto (issue #305). Dirlo, e fermarsi se il picco
+     * non entra nemmeno nella RAM realmente disponibile misurata all'avvio. */
+    if(floored){
+        double peak = (double)m->resident_bytes + (double)capmax*nsp*eb + slack;
+        fprintf(stderr,"[RAM_GB=%.1f%s] WARNING: cap=1 is the floor, projected peak %.1f GB is "
+            "%.1f GB OVER the budget (resident %.1f GB + reserve %.1f GB).%s\n",
+            ram_gb,auto_b?" auto":"",peak/1e9,(peak-ram_gb*1e9)/1e9,
+            m->resident_bytes/1e9,slack/1e9,
+            getenv("PIN_GB")?" PIN_GB is inflating the resident set: lower it or drop it.":"");
+        if(g_mem_avail_boot>0 && peak > g_mem_avail_boot*1e9 &&
+           !(getenv("COLI_RAM_OVERCOMMIT") && atoi(getenv("COLI_RAM_OVERCOMMIT")))){
+            fprintf(stderr,"[RAM] refusing to start: that peak also exceeds the %.1f GB actually "
+                "available on this machine, so the kernel would OOM-kill this run mid-generation.\n"
+                "[RAM] lower PIN_GB, lower the context, or raise the RAM budget if the box really has it "
+                "(COLI_RAM_OVERCOMMIT=1 overrides this check).\n", g_mem_avail_boot);
+            exit(2);
+        }
+    }
     if(capmax < m->ecap){
         fprintf(stderr,"[RAM_GB=%.1f%s] resident %.1f GB + reserve %.1f GB (ws %.1f, KV %dx%d %.1f, kvb %.1f), "
             "experts %.1f MB x %d layers -> cap lowered %d->%d (projected peak %.1f GB)\n",
@@ -6081,7 +6109,31 @@ int main(int argc, char **argv){
     if(g_mmap) fprintf(stderr,"[MMAP] expert = viste zero-copy nei file (page cache = cache)\n");
     g_topk = getenv("TOPK")?atoi(getenv("TOPK")):0;
     g_topp = getenv("TOPP")?atof(getenv("TOPP")):0;
+    /* EXPERT_BUDGET e' sotto quarantena: la finestra operativa e' misurata VUOTA.
+     * @bokiko su tre host (#303) e riprodotto qui su un 25 GB / WSL:
+     *   - hellaswag 30% a budget=8 contro 90% a budget spento (25% = il caso);
+     *   - a budget=4 il decode e' rumore ("The **1...: s2151:");
+     *   - accettazione MTP 0%: quali expert sopravvivono al cap dipende dalla
+     *     residenza in cache al momento del forward, quindi draft e verify NON
+     *     calcolano la stessa funzione -- la stessa invariante che #294 ha appena
+     *     stabilito, violata via stato di cache invece che via scelta del kernel;
+     *   - 0.13 tok/s contro 0.30 di baseline, con 14.66 expert caricati per layer
+     *     contro topk=8: il cap fa piu' I/O di quello che dice di risparmiare, e la
+     *     riga "~N GB I/O saved" conta esperti scartati, non byte non letti.
+     * Resta compilato e sviluppabile (EXPERT_BUDGET_EXPERIMENTAL=1) perche' l'idea
+     * -- MoE-Spec, arXiv 2602.16052 -- non e' sbagliata: e' l'implementazione che
+     * finora non ha un punto in cui sia insieme piu' veloce e corretta. Riaccenderlo
+     * di default richiede una misura di qualita' accanto a quella di velocita'. */
     g_expert_budget = getenv("EXPERT_BUDGET")?atoi(getenv("EXPERT_BUDGET")):0;
+    if(g_expert_budget>0 && !getenv("EXPERT_BUDGET_EXPERIMENTAL")){
+        fprintf(stderr,"[EXPERT_BUDGET] ignored: measured empty operating window (issue #303).\n"
+            "[EXPERT_BUDGET] every tested setting is either no faster or no longer coherent:\n"
+            "[EXPERT_BUDGET]   budget=8 -> hellaswag 30%% (90%% with it off) | budget=4 -> decode is noise\n"
+            "[EXPERT_BUDGET]   MTP acceptance 0%% (the cap breaks the draft/verify contract, #294)\n"
+            "[EXPERT_BUDGET]   0.13 tok/s vs 0.30 baseline, loading 14.7 experts/layer vs topk=8\n"
+            "[EXPERT_BUDGET] set EXPERT_BUDGET_EXPERIMENTAL=1 to run it anyway (expect garbage).\n");
+        g_expert_budget=0;
+    }
     g_cache_route = getenv("CACHE_ROUTE")?atoi(getenv("CACHE_ROUTE")):0;
     g_route_j = getenv("ROUTE_J")?atoi(getenv("ROUTE_J")):2;
     g_route_m = getenv("ROUTE_M")?atoi(getenv("ROUTE_M")):12;
