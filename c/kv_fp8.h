@@ -47,7 +47,9 @@ static inline uint8_t coli_fp8_enc(float f){
 
 /* quantizza una riga latente: scala amax/448 per-riga, ritorna la scala.
  * La riga si decodifica come coli_fp8_lut[b]*scale. Riga tutta zero, subnormale
- * (448/amax andrebbe a +inf) o non finita: byte 0 e scala 1, niente 1/0. */
+ * (448/amax andrebbe a +inf), tutta NaN o con ±inf: byte 0 e scala 1, niente 1/0.
+ * NB: un NaN MISTO a valori finiti non alza amax (fabsf(NaN)>amax e' falso) —
+ * la riga si quantizza normalmente e il NaN diventa byte 0 via coli_fp8_enc. */
 static inline float coli_kv8_quant_row(const float *src, uint8_t *dst, int n){
     float amax=0;
     for(int i=0;i<n;i++){ float a=fabsf(src[i]); if(a>amax) amax=a; }

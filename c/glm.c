@@ -1378,7 +1378,10 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
 static QT qt_load(Model *m, const char *name, int O, int I, int bits){
     QT t; memset(&t,0,sizeof(t)); qt_from_disk(m,name,O,I,bits,0,&t);
 #ifdef COLI_CUDA
-    if(g_cuda_enabled&&g_cuda_dense){
+    /* fmt=4 (int4 a gruppi) non ha un percorso device: row_bytes()=0 nel backend
+     * rifiuta l'upload. Marcarlo eligible sprecava budget proiettato e spegneva in
+     * silenzio l'intera attention GPU KV8 sugli snapshot grouped-int4. */
+    if(g_cuda_enabled&&g_cuda_dense&&t.fmt!=4){
         t.cuda_eligible=1;
         int slot=g_cuda_rr++%g_cuda_ndev; t.cuda_device=g_cuda_devices[slot];
         g_cuda_dense_projected[slot]+=qt_bytes(&t);
@@ -1403,7 +1406,7 @@ static void qt_cuda_colocate(QT *dst,const QT *src){
     dst->cuda_device=src->cuda_device;
 }
 static void layer_cuda_shard_kvb(Layer *l,int H,int Q,int V){
-    if(!g_cuda_enabled||!g_cuda_dense||g_cuda_ndev<2||l->kv_b.fmt==0)return;
+    if(!g_cuda_enabled||!g_cuda_dense||g_cuda_ndev<2||l->kv_b.fmt==0||l->kv_b.fmt==4)return;
     int rb=l->kv_b.fmt==1?l->kv_b.I:(l->kv_b.fmt==2?(l->kv_b.I+1)/2:(l->kv_b.I+3)/4);
     const uint8_t *weights=l->kv_b.fmt==1?(const uint8_t*)l->kv_b.q8:l->kv_b.q4;
     for(int d=0,h0=0;d<g_cuda_ndev;d++){
@@ -2205,11 +2208,14 @@ static int g_absorb=-1;
  * Coperti CPU e CUDA (kernel absorb8); auto-off sotto COLI_METAL, e forza
  * COLI_CUDA_PIPE=0 (l'ombra KV su device e il pipe-prefill leggono righe f32). */
 static int g_kv8=0;
-/* Ombra fp8 residente su device. Paga solo dove il decode passa dall'attention
- * CUDA contigua (kvs==NULL): con piu' slot KV il decode mux e' ragged -> sempre
- * CPU, e l'ombra costerebbe ~max_t*(kvl+R+8) byte per layer di VRAM senza
- * rendere nulla (il prefill carica gli stessi byte in entrambi i casi).
- * AUTO: accesa solo con KV_SLOTS==1. KV_SHADOW=0/1 forza. */
+/* Ombra fp8 residente su device (~max_t*(kvl+R+8) byte per layer di VRAM).
+ * AUTO: sempre ACCESA sotto KV8+CUDA (57204d0) — il prefill a chunk la usa per
+ * non ricaricare l'intera storia fp8 per layer per chunk (~170 GB di PCIe
+ * misurati su un prompt da 124k), e anche il decode ragged multi-slot la usa
+ * per la riga del bound corrente (gate ks==m->kv). Nota: l'ombra e' UNA per
+ * processo — ogni kv_bind cross-slot azzera i watermark e il primo decode dello
+ * slot ricarica tutta la sua storia; ombre per-slot sono il follow-up noto.
+ * KV_SHADOW=0/1 forza. */
 static int g_kv_shadow=0;
 #ifdef COLI_CUDA
 static int g_cuda_pipe=0;   /* COLI_CUDA_PIPE=1: prefill attention chain resident on the layer home device */
@@ -2258,9 +2264,9 @@ static int kv_dev_sync(Model *m, Layer *l, int layer, int upto){
     }
     int v=m->kv_dev_valid[layer];
     if(v<upto){
-        if(!coli_cuda_pipe_upload(dev,m->kv_dev_L[layer]+(size_t)v*kvl,
+        if(!coli_cuda_pipe_upload_async(dev,m->kv_dev_L[layer]+(size_t)v*kvl,
             coli_kv_row(m->kv->Lc[layer],v,kvl),(size_t)(upto-v)*kvl*4)||
-           !coli_cuda_pipe_upload(dev,m->kv_dev_R[layer]+(size_t)v*R,
+           !coli_cuda_pipe_upload_async(dev,m->kv_dev_R[layer]+(size_t)v*R,
             coli_kv_row(m->kv->Rc[layer],v,R),(size_t)(upto-v)*R*4)) return 0;
         m->kv_dev_valid[layer]=upto;
     }
@@ -2280,10 +2286,17 @@ static int kv_dev_sync8(Model *m, Layer *l, int layer, int upto){
          * puo' saperlo): l'ombra si prende solo se al device restano >=1.5 GB
          * DOPO — altrimenti meglio l'upload per-chiamata che affamare densa e
          * scratch (OOM->CPU visto in prod 2026-07-16). */
+        /* Il rifiuto del floor NON si ricalcola a ogni chiamata: cudaMemGetInfo
+         * per layer per token e' un probe sincronizzante, e sotto pressione VRAM
+         * il fallback per-chiamata ricarica l'intera storia a ogni token (O(T^2)
+         * di PCIe cumulato). Backoff: dopo un rifiuto si riprova ogni ~1024
+         * chiamate (≈ ogni dozzina di token a 79 layer). */
+        static int shadow_backoff=0;
+        if(shadow_backoff>0){ shadow_backoff--; return 0; }
         size_t free_b=0,total_b=0;
         double need=(double)m->max_t*(kvl+R+8);
         if(!coli_cuda_mem_info(dev,&free_b,&total_b) ||
-           (double)free_b < need+1.5e9) return 0;
+           (double)free_b < need+1.5e9){ shadow_backoff=1024; return 0; }
         m->kv_dev_L8[layer]=(uint8_t*)coli_cuda_pipe_alloc(dev,(size_t)m->max_t*kvl);
         m->kv_dev_R8[layer]=(uint8_t*)coli_cuda_pipe_alloc(dev,(size_t)m->max_t*R);
         m->kv_dev_Ls[layer]=(float*)coli_cuda_pipe_alloc(dev,(size_t)m->max_t*4);
@@ -2304,13 +2317,16 @@ static int kv_dev_sync8(Model *m, Layer *l, int layer, int upto){
     }
     int v=m->kv_dev_valid[layer];
     if(v<upto){
-        if(!coli_cuda_pipe_upload(dev,m->kv_dev_L8[layer]+(size_t)v*kvl,
+        /* ASYNC sullo stream dei kernel: ordinati per costruzione coi consumer
+         * (stessa stream; ogni chiamata attention termina con una stream-sync),
+         * e il decode smette di pagare 4 memcpy bloccanti per layer per token. */
+        if(!coli_cuda_pipe_upload_async(dev,m->kv_dev_L8[layer]+(size_t)v*kvl,
             coli_kv_row8(m->kv->Lc8[layer],v,kvl),(size_t)(upto-v)*kvl)||
-           !coli_cuda_pipe_upload(dev,m->kv_dev_R8[layer]+(size_t)v*R,
+           !coli_cuda_pipe_upload_async(dev,m->kv_dev_R8[layer]+(size_t)v*R,
             coli_kv_row8(m->kv->Rc8[layer],v,R),(size_t)(upto-v)*R)||
-           !coli_cuda_pipe_upload(dev,m->kv_dev_Ls[layer]+v,
+           !coli_cuda_pipe_upload_async(dev,m->kv_dev_Ls[layer]+v,
             m->kv->Lsc[layer]+v,(size_t)(upto-v)*4)||
-           !coli_cuda_pipe_upload(dev,m->kv_dev_Rs[layer]+v,
+           !coli_cuda_pipe_upload_async(dev,m->kv_dev_Rs[layer]+v,
             m->kv->Rsc[layer]+v,(size_t)(upto-v)*4)) return 0;
         m->kv_dev_valid[layer]=upto;
     }
@@ -2501,16 +2517,31 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         matmul_qt_ex(Q, QR, &l->q_b, S, 0);
         matmul_qt_ex(comp, x, &l->kv_a, S, 0);
     }
-    if(!pipe_done) for(int s=0;s<S;s++){
+#ifdef COLI_CUDA
+    /* Accorcia l'ombra PRIMA del loop (min pos riscritto), cosi' il loop caldo
+     * resta senza stato condiviso e puo' girare in parallelo. */
+    if(!pipe_done&&m->kv_dev_valid&&layer<=c->n_layers){
+        int minpos=-1;
+        for(int s=0;s<S;s++){
+            KVState *ks=kvs?kvs[s]:m->kv;
+            if(ks!=m->kv) continue;
+            int pos=positions?positions[s]:pos_base+s;
+            if(minpos<0||pos<minpos) minpos=pos;
+        }
+        if(minpos>=0&&m->kv_dev_valid[layer]>minpos) m->kv_dev_valid[layer]=minpos;
+    }
+#endif
+    /* Produttore KV: righe indipendenti (ogni s scrive solo la SUA riga pos).
+     * Era seriale — sotto KV8 sono ~576 encode libm per riga per layer, minuti
+     * su un prompt lungo mentre il pool OMP dormiva. */
+    if(!pipe_done){
+    #pragma omp parallel for schedule(static) if(S>8)
+    for(int s=0;s<S;s++){
         KVState *ks=kvs?kvs[s]:m->kv;
         int pos=positions?positions[s]:pos_base+s;
         float *qfull=Q+(int64_t)s*H*qh;
         for(int h=0;h<H;h++) rope_interleave(qfull+(int64_t)h*qh+c->qk_nope, pos, c);
         const float *cs=comp+(int64_t)s*cw;
-#ifdef COLI_CUDA
-        if(ks==m->kv&&m->kv_dev_valid&&layer<=c->n_layers&&m->kv_dev_valid[layer]>pos)
-            m->kv_dev_valid[layer]=pos;              /* riga riscritta: l'ombra si accorcia */
-#endif
         if(g_kv8){
             /* KV8: norma+rope sul residuo di comp (scratch, mai riletto), poi
              * quantizza riga+scala. E' IL produttore caldo: ogni token, ogni layer. */
@@ -2528,6 +2559,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             rope_interleave(Rdst, pos, c);                        /* k_rot roped, condiviso fra teste */
         }
     }
+    }
     /* ---- DSA lightning indexer ----
      * Layer FULL: k_idx dei token nuovi in cache + selezione top-k per query (riusata
      * dai layer SHARED successivi). Selezione attiva solo con contesto > index_topk
@@ -2543,7 +2575,12 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * ignorano — calcolarla comunque era la parete quadratica del prompt lungo
      * (l'output NON cambia: cambia solo il lavoro sprecato). Le CHIAVI indexer
      * (Ic) si scrivono SEMPRE: servono al decode futuro. */
-    int want_sel = !(cuda_absorb && S>4);
+    /* Le verify del decode speculativo (g_spec_live, S=1+g fino a 64) NON sono
+     * prefill: i draft nascono sotto attenzione sparsa top-k e vanno verificati
+     * con la STESSA funzione, altrimenti a temp=0 i quasi-pareggi si ribaltano e
+     * l'accettazione crolla (patologia #163). Il ramo denso resta solo per il
+     * prefill vero. */
+    int want_sel = !(cuda_absorb && S>4 && !g_spec_live);
     if(m->has_dsa && layer<c->n_layers && ((!kvs && m->kv_start[layer]==0) || kvs)){
         int nh=c->index_nh, hd=c->index_hd; dtopk=c->index_topk;
         if(c->idx_type[layer]){
@@ -2644,7 +2681,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
          * il percorso fedele-sparso su CPU costa O(T^2 log T) di qsort
          * dell'indexer — misurato ~8 ORE per un prompt da 124k (2026-07-16). */
         int sel_any=0;
-        if(g_kv8&&S<=4&&dnsel) for(int s2=0;s2<S;s2++) if(dnsel[s2]>0){sel_any=1;break;}
+        if(g_kv8&&(S<=4||g_spec_live)&&dnsel) for(int s2=0;s2<S;s2++) if(dnsel[s2]>0){sel_any=1;break;}
         if(cuda_absorb&&!sel_any&&l->n_kv_b_shard>1){
             int n=l->n_kv_b_shard,st0=m->kv_start[layer],nt=pos_base+S-st0,ok=1;
             float *qs=falloc((int64_t)S*H*qh),*cs=falloc((int64_t)S*H*vh);
@@ -2687,8 +2724,8 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             cuda_core=cuda_projected=coli_cuda_attention_project_batch(l->kv_b.cuda,l->o.cuda,out,Q,
                     coli_kv_row(m->Lc[layer],st0,kvl),coli_kv_row(m->Rc[layer],st0,c->qk_rope),
                     S,H,c->qk_nope,c->qk_rope,vh,kvl,nt,c->attn_scale);
-        } else if(S<=4&&g_cuda_enabled&&getenv("COLI_CUDA_ATTN")&&atoi(getenv("COLI_CUDA_ATTN"))&&
-           l->kv_b.cuda_eligible&&qt_cuda_upload(&l->kv_b)){
+        } else if((S<=4||(g_spec_live&&S<=64))&&g_cuda_enabled&&getenv("COLI_CUDA_ATTN")&&
+           atoi(getenv("COLI_CUDA_ATTN"))&&l->kv_b.cuda_eligible&&qt_cuda_upload(&l->kv_b)){
             cuda_core=1;
             for(int s=0;s<S&&cuda_core;s++){
                 KVState *ks=kvs?kvs[s]:m->kv;int pos=positions?positions[s]:pos_base+s;
@@ -4096,11 +4133,29 @@ static float *step_all(Model *m, const int *ids, int S, int pos_base){
  * (una riga di draft-KV stantia per confine: i draft restano verificati).
  * PREFILL_CHUNK=0 disattiva, default 2048. */
 static int g_prefill_chunk=2048;
+/* La riga MTP "a cavallo" del confine di chunk non viene mai scritta (step
+ * assorbe solo S-1 coppie) ma mtp_draft la LEGGE: kv_alloc non azzera nulla
+ * (malloc puro), quindi era memoria non inizializzata — score dei draft
+ * spazzatura (o NaN) a ogni confine. Riga inerte esplicita: byte 0/scala 1
+ * sotto KV8, zeri f32 altrimenti (il dequant da' 0, il dot e' inerte). */
+static void kv_mtp_row_zero(Model *m, int pos){
+    Cfg *c=&m->c; int L=c->n_layers;
+    if(!m->has_mtp || pos<0 || pos>=m->kv->max_t) return;
+    if(g_kv8){
+        if(m->Lc8&&m->Lc8[L]){ memset(coli_kv_row8(m->Lc8[L],pos,c->kv_lora),0,(size_t)c->kv_lora);
+                               m->Lsc[L][pos]=1.f; }
+        if(m->Rc8&&m->Rc8[L]){ memset(coli_kv_row8(m->Rc8[L],pos,c->qk_rope),0,(size_t)c->qk_rope);
+                               m->Rsc[L][pos]=1.f; }
+    } else {
+        if(m->Lc&&m->Lc[L]) memset(coli_kv_row(m->Lc[L],pos,c->kv_lora),0,(size_t)c->kv_lora*4);
+        if(m->Rc&&m->Rc[L]) memset(coli_kv_row(m->Rc[L],pos,c->qk_rope),0,(size_t)c->qk_rope*4);
+    }
+}
 static float *step_prefill(Model *m, const int *ids, int S, int pos_base){
     int ch=g_prefill_chunk;
     if(ch<=0 || S<=ch) return step(m,ids,S,pos_base);
     int off=0;
-    while(S-off>ch){ free(step(m,ids+off,ch,pos_base+off)); off+=ch; }
+    while(S-off>ch){ free(step(m,ids+off,ch,pos_base+off)); kv_mtp_row_zero(m,pos_base+off+ch-1); off+=ch; }
     return step(m,ids+off,S-off,pos_base+off);
 }
 
@@ -4928,6 +4983,11 @@ static int kv_disk_open(Model *m){
 static void kv_disk_truncate(Model *m, int nrec){
     if(!g_kvsave) return;
     KVState *k=m->kv;
+    /* Mai scrivere nell'header piu' record di quanti ne esistano fisicamente:
+     * un append saltato (OOM dello staging, open fallita) lascia disk_nrec<len,
+     * e un truncate al prefix comune dentro quel buco estenderebbe il file su
+     * record MAI scritti — il load successivo li leggerebbe come spazzatura. */
+    if(nrec>k->disk_nrec) nrec=k->disk_nrec;
     if(k->disk_fp){ fclose(k->disk_fp); k->disk_fp=NULL; }  /* drop to shrink on disc */
     FILE *f=fopen(k->disk_path,"r+b");
     if(!f){ k->disk_nrec=0; return; }
@@ -4970,9 +5030,30 @@ static void kv_disk_append(Model *m, const int *hist, int len){
         fwrite(k->disk_buf, 1, (size_t)rec, f);   /* one fwrite per position (was ~157) */
     }
     fflush(f);                                   /* dati prima, contatore poi */
+#ifdef _WIN32
+    _commit(_fileno(f));
+#else
+    fsync(fileno(f));                            /* i DATI su disco prima che il contatore
+                                                  * li dichiari: fflush ferma solo alla page
+                                                  * cache e un power-loss puo' persistere
+                                                  * nrec prima dei record che conta */
+#endif
     int32_t nr=len; fseek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f);
     fflush(f);                                   /* persist the counter too */
+#ifdef _WIN32
+    _commit(_fileno(f));
+#else
+    fsync(fileno(f));
+#endif
     k->disk_nrec=len;
+}
+/* Bonifica una riga fp8 letta da disco. L'encoder non emette MAI i codici NaN
+ * e4m3 (0x7F/0xFF) e la LUT CPU li decodifica 0, ma la GPU (__nv_cvt) li
+ * decodifica NaN: un file corrotto genererebbe output finito su CPU e softmax
+ * avvelenata su CUDA. Scala non finita: riga inerte (byte 0, scala 1). */
+static inline void kv8_sanitize_row(uint8_t *b, int n, float *sc){
+    if(!(fabsf(*sc)<3.4e38f)){ memset(b,0,(size_t)n); *sc=1.f; return; }
+    for(int i=0;i<n;i++) if((b[i]&0x7F)==0x7F) b[i]=0;
 }
 static int kv_disk_load(Model *m, int *hist, int maxctx){
     if(!g_kvsave) return 0;
@@ -5005,6 +5086,8 @@ static int kv_disk_load(Model *m, int *hist, int maxctx){
                    fread(&m->Lsc[i][p], 4, 1, f)!=1 ||
                    fread(coli_kv_row8(m->Rc8[i],p,c->qk_rope), 1, c->qk_rope, f)!=(size_t)c->qk_rope ||
                    fread(&m->Rsc[i][p], 4, 1, f)!=1){ nrec=p; goto out; }
+                kv8_sanitize_row(coli_kv_row8(m->Lc8[i],p,c->kv_lora), c->kv_lora, &m->Lsc[i][p]);
+                kv8_sanitize_row(coli_kv_row8(m->Rc8[i],p,c->qk_rope), c->qk_rope, &m->Rsc[i][p]);
             } else if(g_kv8){
                 if(fread(stage, 4, c->kv_lora, f)!=(size_t)c->kv_lora){ nrec=p; goto out; }
                 m->Lsc[i][p]=coli_kv8_quant_row(stage, coli_kv_row8(m->Lc8[i],p,c->kv_lora), c->kv_lora);
@@ -5928,12 +6011,27 @@ static double kv_pool_bytes(Model *m, int max_ctx){
     return one*slots;
 }
 
+/* L'assorbimento e' DAVVERO forzato solo se il gate runtime (2538/2619) lo forza:
+ * ABSORB=1 esplicito, oppure CUDA compilato+attivo con COLI_CUDA_ATTN e kv_lora<=512.
+ * Controllare la sola env var (bug: binario CPU-only con COLI_CUDA_ATTN=1 nel
+ * profilo) scartava la riserva kvb_all (~30 GB a 256k) che il prefill S>4 poi
+ * alloca comunque -> OOM-kill a meta' prefill. */
+static int absorb_forced_now(Model *m){
+    if(g_absorb==1) return 1;
+#ifdef COLI_CUDA
+    if(g_cuda_enabled && getenv("COLI_CUDA_ATTN") && atoi(getenv("COLI_CUDA_ATTN")) &&
+       m->c.kv_lora<=512) return 1;
+#endif
+    (void)m;
+    return 0;
+}
+
 /* byte disponibili per gli expert (pin + LRU) nel budget — specchio del conto di cap_for_ram */
 static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx){
     Cfg *c=&m->c; int64_t eb=expert_bytes_probe(m,ebits);
     if(ram_gb<=0){ ram_gb=g_mem_avail_boot*0.88; if(ram_gb<4) ram_gb=8; }
     double ws_b = (g_expert_budget>0 && g_expert_budget<64) ? (double)(g_expert_budget+4)*(double)eb : 64.0*(double)eb;
-    int absorb_forced = (getenv("COLI_CUDA_ATTN")&&atoi(getenv("COLI_CUDA_ATTN"))) || g_absorb==1;
+    int absorb_forced = absorb_forced_now(m);
     double slack = 1.2e9 + 2.5e9 + ws_b
         + kv_pool_bytes(m,max_ctx)
         + (absorb_forced ? 0.0 : (double)max_ctx*c->n_heads*(c->qk_nope+c->v_head)*4.0);
@@ -5967,7 +6065,7 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
      * quando l'assorbimento e' forzato (COLI_CUDA_ATTN o ABSORB=1): riservarlo
      * comunque vale 30 GB fantasma a 256k e 120 GB a 1M — e' questo termine a
      * decidere se 1M di contesto sta in RAM su questo host. */
-    int absorb_forced = (getenv("COLI_CUDA_ATTN")&&atoi(getenv("COLI_CUDA_ATTN"))) || g_absorb==1;
+    int absorb_forced = absorb_forced_now(m);
     double kvb_b = absorb_forced ? 0.0
                  : (double)max_ctx*c->n_heads*(c->qk_nope+c->v_head)*4.0;
     /* RISERVA PAGE-CACHE (misurato 2026-07-06 su Linux): strangolarla fa crollare

@@ -140,6 +140,9 @@ COLI_CUDA_DLLEXPORT float *coli_cuda_pipe_scratch(int device,int slot,size_t byt
 COLI_CUDA_DLLEXPORT void *coli_cuda_pipe_alloc(int device,size_t bytes);
 COLI_CUDA_DLLEXPORT void coli_cuda_pipe_free(int device,void *p);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_upload(int device,void *dst,const void *src,size_t bytes);
+/* Come pipe_upload ma ordinato sullo stream dei kernel del device (staging
+ * pinned, cudaMemcpyAsync): niente race col NULL stream, niente blocco host. */
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_upload_async(int device,void *dst,const void *src,size_t bytes);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_download(int device,const void *src,void *dst,size_t bytes);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rmsnorm(int device,float *y_dev,const float *x_dev,
                            const float *w_dev,int S,int D,float eps);

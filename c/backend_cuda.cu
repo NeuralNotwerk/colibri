@@ -4,6 +4,7 @@
 #include <cuda_fp8.h>                 /* KV8: fp8 e4m3 latent KV (hw cvt on sm_89+, our arches) */
 #include <mma.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -30,6 +31,7 @@ typedef struct {
     float *asel; size_t asel_cap;                  /* KV8+DSA: lista di selezione (int, riusa reserve) */
     float *apart; size_t apart_cap;                /* KV8 split-T: parziali (cl[K],m,z) per (testa,split) */
     float *pipe_buf[24]; size_t pipe_cap[24];   /* scratch persistenti del resident pipeline */
+    uint8_t *kvstage; size_t kvstage_cap,kvstage_off;  /* ring pinned per gli upload async dell'ombra KV */
     cudaStream_t stream;
     void *group_desc; size_t group_desc_cap;
     size_t tensor_count, tensor_bytes;
@@ -116,6 +118,20 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
     }
     if (!threadIdx.x)
         y[(size_t)s * O + o] = partial[0] * (fmt ? scales[o] : 1.0f);
+}
+
+/* quant_matmul mette le righe S su grid-Y (max 65535): un batch piu' lungo
+ * (PREFILL_CHUNK=0 su un prompt >65k) fallirebbe il lancio DOPO che l'attention
+ * e' gia' stata pagata, ricadendo in silenzio su CPU — lo stesso tetto che il
+ * kernel streaming ha gia' eliminato mettendo S su grid-X. Lancia a fette. */
+static void quant_matmul_rows(float *y, const float *x, const void *weights,
+                              const float *scales, int fmt, int S, int I, int O,
+                              size_t rb, cudaStream_t stream) {
+    for (int s0 = 0; s0 < S; s0 += 65535) {
+        int sn = S - s0 < 65535 ? S - s0 : 65535;
+        quant_matmul<<<dim3((unsigned)O,(unsigned)sn),256,0,stream>>>(
+            y + (size_t)s0 * O, x + (size_t)s0 * I, weights, scales, fmt, sn, I, O, rb);
+    }
 }
 
 __global__ static void silu_mul(float *gate, const float *up, size_t n) {
@@ -297,6 +313,31 @@ __device__ static inline float fp8_e4m3(uint8_t b){
     return __half2float(__half(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)b,__NV_E4M3)));
 }
 
+/* Dot di una riga fp8 contro un vettore f32, a carichi VETTORIALI (uint4 = 16
+ * byte per istruzione di load). Il profilo ncu del kernel streaming era load-
+ * bound (L1 97.5%, SM 19%, DRAM ~0): un load per BYTE. Stessa matematica,
+ * stesso ordine di somma per elemento — cambia solo la larghezza del load. */
+__device__ static inline float fp8_dot4(const float *qa,uint32_t w){
+    return qa[0]*fp8_e4m3((uint8_t)(w&0xffu))
+         + qa[1]*fp8_e4m3((uint8_t)((w>>8)&0xffu))
+         + qa[2]*fp8_e4m3((uint8_t)((w>>16)&0xffu))
+         + qa[3]*fp8_e4m3((uint8_t)((w>>24)&0xffu));
+}
+__device__ static inline float fp8_row_dot(const float *qa,const uint8_t *p,int n){
+    float a=0;
+    if(!(n&15) && !((uintptr_t)p&15)){
+        const uint4 *v=(const uint4*)p;
+        int nq=n>>4;
+        for(int i=0;i<nq;i++){
+            uint4 w=v[i]; const float *qk=qa+(i<<4);
+            a+=fp8_dot4(qk,w.x)+fp8_dot4(qk+4,w.y)+fp8_dot4(qk+8,w.z)+fp8_dot4(qk+12,w.w);
+        }
+        return a;
+    }
+    for(int k=0;k<n;k++)a+=qa[k]*fp8_e4m3(p[k]);
+    return a;
+}
+
 __global__ static void attention_absorb_kernel(float *ctx,const float *q,const float *latent,
                                                 const float *rope,const void *weights,const float *wscale,
                                                 int fmt,int H,int Q,int R,int V,int K,int T,float scale){
@@ -356,20 +397,35 @@ __global__ static void attention_absorb_kernel8(float *ctx,const float *q,const 
         const float *lsc,const uint8_t *rope,const float *rsc,const void *weights,
         const float *wscale,int fmt,int H,int Q,int R,int V,int K,int T,float scale){
     int h=blockIdx.x,tid=threadIdx.x,rbase=h*(Q+V);extern __shared__ float sm[];
-    float *qa=sm,*cl=qa+K,*scores=cl+K;
+    float *qa=sm,*cl=qa+K,*scores=cl+K,*red=scores+T;
     for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int d=0;d<Q;d++)
         a+=q[(size_t)h*(Q+R)+d]*weight_at(weights,fmt,(size_t)(rbase+d)*row_bytes(fmt,K),k)*(fmt?wscale[rbase+d]:1.f);qa[k]=a;}
     __syncthreads();
-    for(int t=tid;t<T;t+=blockDim.x){float a=0,ar=0;const uint8_t *lt=latent+(size_t)t*K,*rt=rope+(size_t)t*R;
-        for(int k=0;k<K;k++)a+=qa[k]*fp8_e4m3(lt[k]);
-        for(int d=0;d<R;d++)ar+=q[(size_t)h*(Q+R)+Q+d]*fp8_e4m3(rt[d]);
+    for(int t=tid;t<T;t+=blockDim.x){const uint8_t *lt=latent+(size_t)t*K,*rt=rope+(size_t)t*R;
+        float a=fp8_row_dot(qa,lt,K);
+        float ar=fp8_row_dot(q+(size_t)h*(Q+R)+Q,rt,R);
         scores[t]=(a*lsc[t]+ar*rsc[t])*scale;}
     __syncthreads();
-    if(!tid){float mx=scores[0];for(int t=1;t<T;t++)mx=fmaxf(mx,scores[t]);float z=0;
-        for(int t=0;t<T;t++){scores[t]=expf(scores[t]-mx);z+=scores[t];}for(int t=0;t<T;t++)scores[t]/=z;}
+    /* softmax a riduzione ad albero (era seriale su thread 0: 3 passate
+     * dipendenti su T<=4096 elementi mentre 255 thread aspettavano) */
+    float local=-3.402823466e+38F;for(int t=tid;t<T;t+=blockDim.x)local=fmaxf(local,scores[t]);
+    red[tid]=local;__syncthreads();
+    for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]=fmaxf(red[tid],red[tid+n]);__syncthreads();}
+    float mx=red[0];local=0;for(int t=tid;t<T;t+=blockDim.x){float e=expf(scores[t]-mx);scores[t]=e;local+=e;}
+    red[tid]=local;__syncthreads();
+    for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]+=red[tid+n];__syncthreads();}
+    float inv=1.f/red[0];
+    for(int t=tid;t<T;t+=blockDim.x)scores[t]*=inv*lsc[t];   /* normalizza + scala fusa nel peso */
     __syncthreads();
-    for(int t=tid;t<T;t+=blockDim.x)scores[t]*=lsc[t];       /* scala fusa nel peso softmax */
-    __syncthreads();
+    /* accumulo del contesto latente: quad di k per thread — load uchar4 COALESCENTI
+     * al posto dei load colonna per-byte (stride K) del loop originale. */
+    if(!(K&3)&&!((uintptr_t)latent&3)){
+        for(int kq=tid;kq<(K>>2);kq+=blockDim.x){int k0=kq<<2;float a0=0,a1=0,a2=0,a3=0;
+            for(int t=0;t<T;t++){uint32_t w=*(const uint32_t*)(latent+(size_t)t*K+k0);float sw=scores[t];
+                a0+=sw*fp8_e4m3((uint8_t)(w&0xffu));a1+=sw*fp8_e4m3((uint8_t)((w>>8)&0xffu));
+                a2+=sw*fp8_e4m3((uint8_t)((w>>16)&0xffu));a3+=sw*fp8_e4m3((uint8_t)((w>>24)&0xffu));}
+            cl[k0]=a0;cl[k0+1]=a1;cl[k0+2]=a2;cl[k0+3]=a3;}
+    } else
     for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int t=0;t<T;t++)a+=scores[t]*fp8_e4m3(latent[(size_t)t*K+k]);cl[k]=a;}
     __syncthreads();
     for(int v=tid;v<V;v+=blockDim.x){int row=rbase+Q+v;float a=0;size_t rb=row_bytes(fmt,K);
@@ -388,9 +444,9 @@ __global__ static void attention_absorb_batch_kernel8(float *ctx,const float *q,
         a+=qs[d]*weight_at(weights,fmt,(size_t)(rbase+d)*row_bytes(fmt,K),k)*
           (fmt?wscale[rbase+d]:1.f);qa[k]=a;}
     __syncthreads();
-    for(int t=tid;t<nt;t+=blockDim.x){float a=0,ar=0;const uint8_t *lt=latent+(size_t)t*K;
-        const uint8_t *rt=rope+(size_t)t*R;for(int k=0;k<K;k++)a+=qa[k]*fp8_e4m3(lt[k]);
-        for(int d=0;d<R;d++)ar+=qs[Q+d]*fp8_e4m3(rt[d]);
+    for(int t=tid;t<nt;t+=blockDim.x){const uint8_t *lt=latent+(size_t)t*K;
+        const uint8_t *rt=rope+(size_t)t*R;float a=fp8_row_dot(qa,lt,K);
+        float ar=fp8_row_dot(qs+Q,rt,R);
         scores[t]=(a*lsc[t]+ar*rsc[t])*scale;}
     __syncthreads();
     float local=-3.402823466e+38F;for(int t=tid;t<nt;t+=blockDim.x)local=fmaxf(local,scores[t]);
@@ -402,6 +458,15 @@ __global__ static void attention_absorb_batch_kernel8(float *ctx,const float *q,
     float inv=1.f/red[0];
     for(int t=tid;t<nt;t+=blockDim.x)scores[t]*=inv*lsc[t];  /* normalizza + scala fusa nel peso */
     __syncthreads();
+    /* accumulo del contesto latente: quad di k per thread — load uchar4 COALESCENTI
+     * al posto dei load colonna per-byte (stride K) del loop originale. */
+    if(!(K&3)&&!((uintptr_t)latent&3)){
+        for(int kq=tid;kq<(K>>2);kq+=blockDim.x){int k0=kq<<2;float a0=0,a1=0,a2=0,a3=0;
+            for(int t=0;t<nt;t++){uint32_t w=*(const uint32_t*)(latent+(size_t)t*K+k0);float sw=scores[t];
+                a0+=sw*fp8_e4m3((uint8_t)(w&0xffu));a1+=sw*fp8_e4m3((uint8_t)((w>>8)&0xffu));
+                a2+=sw*fp8_e4m3((uint8_t)((w>>16)&0xffu));a3+=sw*fp8_e4m3((uint8_t)((w>>24)&0xffu));}
+            cl[k0]=a0;cl[k0+1]=a1;cl[k0+2]=a2;cl[k0+3]=a3;}
+    } else
     for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int t=0;t<nt;t++)
         a+=scores[t]*fp8_e4m3(latent[(size_t)t*K+k]);cl[k]=a;}
     __syncthreads();
@@ -435,9 +500,9 @@ __global__ static void attention_absorb_stream_kernel8(float *ctx,const float *q
     for(int t0=0;t0<nt;t0+=COLI_ATTN_TILE){
         int tn=nt-t0<COLI_ATTN_TILE?nt-t0:COLI_ATTN_TILE;
         for(int j=tid;j<tn;j+=blockDim.x){int t=t0+j;
-            float a=0,ar=0;const uint8_t *lt=latent+(size_t)t*K,*rt=rope+(size_t)t*R;
-            for(int k=0;k<K;k++)a+=qa[k]*fp8_e4m3(lt[k]);
-            for(int d=0;d<R;d++)ar+=qs[Q+d]*fp8_e4m3(rt[d]);
+            const uint8_t *lt=latent+(size_t)t*K,*rt=rope+(size_t)t*R;
+            float a=fp8_row_dot(qa,lt,K);
+            float ar=fp8_row_dot(qs+Q,rt,R);
             tls[j]=lsc[t];
             tsc[j]=(a*tls[j]+ar*rsc[t])*scale;}
         __syncthreads();
@@ -453,9 +518,22 @@ __global__ static void attention_absorb_stream_kernel8(float *ctx,const float *q
         red[tid]=local;__syncthreads();
         for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]+=red[tid+n];__syncthreads();}
         if(!tid){run_z=run_z*fac+red[0];run_m=new_m;}
+        /* peso*scala precalcolato una volta per riga (era rifatto per ogni k) */
+        for(int j=tid;j<tn;j+=blockDim.x)tsc[j]*=tls[j];
+        __syncthreads();
+        /* quad di k per thread: load uchar4 coalescenti al posto dei load
+         * colonna per-byte (stride K) */
+        if(!(K&3)&&!((uintptr_t)latent&3)){
+            for(int kq=tid;kq<(K>>2);kq+=blockDim.x){int k0=kq<<2;
+                float a0=cl[k0]*fac,a1=cl[k0+1]*fac,a2=cl[k0+2]*fac,a3=cl[k0+3]*fac;
+                for(int j=0;j<tn;j++){uint32_t w=*(const uint32_t*)(latent+(size_t)(t0+j)*K+k0);float sw=tsc[j];
+                    a0+=sw*fp8_e4m3((uint8_t)(w&0xffu));a1+=sw*fp8_e4m3((uint8_t)((w>>8)&0xffu));
+                    a2+=sw*fp8_e4m3((uint8_t)((w>>16)&0xffu));a3+=sw*fp8_e4m3((uint8_t)((w>>24)&0xffu));}
+                cl[k0]=a0;cl[k0+1]=a1;cl[k0+2]=a2;cl[k0+3]=a3;}
+        } else
         for(int k=tid;k<K;k+=blockDim.x){
             float a=cl[k]*fac;
-            for(int j=0;j<tn;j++)a+=tsc[j]*tls[j]*fp8_e4m3(latent[(size_t)(t0+j)*K+k]);
+            for(int j=0;j<tn;j++)a+=tsc[j]*fp8_e4m3(latent[(size_t)(t0+j)*K+k]);
             cl[k]=a;}
         __syncthreads();
     }
@@ -490,9 +568,9 @@ __global__ static void attention_absorb_split_kernel8(float *part,const float *q
     for(int b0=t0;b0<t1;b0+=COLI_ATTN_TILE){
         int tn=t1-b0<COLI_ATTN_TILE?t1-b0:COLI_ATTN_TILE;
         for(int j=tid;j<tn;j+=blockDim.x){int t=b0+j;
-            float a=0,ar=0;const uint8_t *lt=latent+(size_t)t*K,*rt=rope+(size_t)t*R;
-            for(int k=0;k<K;k++)a+=qa[k]*fp8_e4m3(lt[k]);
-            for(int d=0;d<R;d++)ar+=q[(size_t)h*(Q+R)+Q+d]*fp8_e4m3(rt[d]);
+            const uint8_t *lt=latent+(size_t)t*K,*rt=rope+(size_t)t*R;
+            float a=fp8_row_dot(qa,lt,K);
+            float ar=fp8_row_dot(q+(size_t)h*(Q+R)+Q,rt,R);
             tls[j]=lsc[t];
             tsc[j]=(a*tls[j]+ar*rsc[t])*scale;}
         __syncthreads();
@@ -508,9 +586,22 @@ __global__ static void attention_absorb_split_kernel8(float *part,const float *q
         red[tid]=local;__syncthreads();
         for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]+=red[tid+n];__syncthreads();}
         if(!tid){run_z=run_z*fac+red[0];run_m=new_m;}
+        /* peso*scala precalcolato una volta per riga (era rifatto per ogni k) */
+        for(int j=tid;j<tn;j+=blockDim.x)tsc[j]*=tls[j];
+        __syncthreads();
+        /* quad di k per thread: load uchar4 coalescenti al posto dei load
+         * colonna per-byte (stride K) */
+        if(!(K&3)&&!((uintptr_t)latent&3)){
+            for(int kq=tid;kq<(K>>2);kq+=blockDim.x){int k0=kq<<2;
+                float a0=cl[k0]*fac,a1=cl[k0+1]*fac,a2=cl[k0+2]*fac,a3=cl[k0+3]*fac;
+                for(int j=0;j<tn;j++){uint32_t w=*(const uint32_t*)(latent+(size_t)(b0+j)*K+k0);float sw=tsc[j];
+                    a0+=sw*fp8_e4m3((uint8_t)(w&0xffu));a1+=sw*fp8_e4m3((uint8_t)((w>>8)&0xffu));
+                    a2+=sw*fp8_e4m3((uint8_t)((w>>16)&0xffu));a3+=sw*fp8_e4m3((uint8_t)((w>>24)&0xffu));}
+                cl[k0]=a0;cl[k0+1]=a1;cl[k0+2]=a2;cl[k0+3]=a3;}
+        } else
         for(int k=tid;k<K;k+=blockDim.x){
             float a=cl[k]*fac;
-            for(int j=0;j<tn;j++)a+=tsc[j]*tls[j]*fp8_e4m3(latent[(size_t)(b0+j)*K+k]);
+            for(int j=0;j<tn;j++)a+=tsc[j]*fp8_e4m3(latent[(size_t)(b0+j)*K+k]);
             cl[k]=a;}
         __syncthreads();
     }
@@ -551,21 +642,33 @@ __global__ static void attention_absorb_sel_kernel8(float *ctx,const float *q,
         const int *sel,const void *weights,const float *wscale,
         int fmt,int H,int Q,int R,int V,int K,int NS,float scale){
     int h=blockIdx.x,tid=threadIdx.x,rbase=h*(Q+V);extern __shared__ float sm[];
-    float *qa=sm,*cl=qa+K,*scores=cl+K;
+    float *qa=sm,*cl=qa+K,*scores=cl+K,*red=scores+NS;
     for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int d=0;d<Q;d++)
         a+=q[(size_t)h*(Q+R)+d]*weight_at(weights,fmt,(size_t)(rbase+d)*row_bytes(fmt,K),k)*(fmt?wscale[rbase+d]:1.f);qa[k]=a;}
     __syncthreads();
     for(int jj=tid;jj<NS;jj+=blockDim.x){int t=sel[jj];
-        float a=0,ar=0;const uint8_t *lt=latent+(size_t)t*K,*rt=rope+(size_t)t*R;
-        for(int k=0;k<K;k++)a+=qa[k]*fp8_e4m3(lt[k]);
-        for(int d=0;d<R;d++)ar+=q[(size_t)h*(Q+R)+Q+d]*fp8_e4m3(rt[d]);
+        const uint8_t *lt=latent+(size_t)t*K,*rt=rope+(size_t)t*R;
+        float a=fp8_row_dot(qa,lt,K);
+        float ar=fp8_row_dot(q+(size_t)h*(Q+R)+Q,rt,R);
         scores[jj]=(a*lsc[t]+ar*rsc[t])*scale;}
     __syncthreads();
-    if(!tid){float mx=scores[0];for(int t=1;t<NS;t++)mx=fmaxf(mx,scores[t]);float z=0;
-        for(int t=0;t<NS;t++){scores[t]=expf(scores[t]-mx);z+=scores[t];}for(int t=0;t<NS;t++)scores[t]/=z;}
+    /* softmax a riduzione ad albero (era seriale su thread 0 con 255 thread fermi) */
+    float local=-3.402823466e+38F;for(int t=tid;t<NS;t+=blockDim.x)local=fmaxf(local,scores[t]);
+    red[tid]=local;__syncthreads();
+    for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]=fmaxf(red[tid],red[tid+n]);__syncthreads();}
+    float mx=red[0];local=0;for(int t=tid;t<NS;t+=blockDim.x){float e=expf(scores[t]-mx);scores[t]=e;local+=e;}
+    red[tid]=local;__syncthreads();
+    for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]+=red[tid+n];__syncthreads();}
+    float inv=1.f/red[0];
+    for(int jj=tid;jj<NS;jj+=blockDim.x)scores[jj]*=inv*lsc[sel[jj]];   /* normalizza + scala fusa */
     __syncthreads();
-    for(int jj=tid;jj<NS;jj+=blockDim.x)scores[jj]*=lsc[sel[jj]];   /* scala fusa nel peso */
-    __syncthreads();
+    if(!(K&3)&&!((uintptr_t)latent&3)){
+        for(int kq=tid;kq<(K>>2);kq+=blockDim.x){int k0=kq<<2;float a0=0,a1=0,a2=0,a3=0;
+            for(int jj=0;jj<NS;jj++){uint32_t w=*(const uint32_t*)(latent+(size_t)sel[jj]*K+k0);float sw=scores[jj];
+                a0+=sw*fp8_e4m3((uint8_t)(w&0xffu));a1+=sw*fp8_e4m3((uint8_t)((w>>8)&0xffu));
+                a2+=sw*fp8_e4m3((uint8_t)((w>>16)&0xffu));a3+=sw*fp8_e4m3((uint8_t)((w>>24)&0xffu));}
+            cl[k0]=a0;cl[k0+1]=a1;cl[k0+2]=a2;cl[k0+3]=a3;}
+    } else
     for(int k=tid;k<K;k+=blockDim.x){float a=0;
         for(int jj=0;jj<NS;jj++)a+=scores[jj]*fp8_e4m3(latent[(size_t)sel[jj]*K+k]);cl[k]=a;}
     __syncthreads();
@@ -573,31 +676,120 @@ __global__ static void attention_absorb_sel_kernel8(float *ctx,const float *q,
         for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k);ctx[(size_t)h*V+v]=a*(fmt?wscale[row]:1.f);}
 }
 
+/* Split della SELEZIONE (stile flash-decoding, come il gemello denso split-T):
+ * 64 blocchi (uno per testa) non riempiono una GPU da 170 SM — misurato 16.7%%
+ * di occupancy e 6.6%% di SM sul percorso DSA di produzione. dim3(H,P): ogni
+ * blocco produce un parziale online-softmax (cl[K],m,z) sulla SUA fetta della
+ * lista; il merge esistente li ricombina. Stessa softmax, ordine fp diverso. */
+__global__ static void attention_absorb_sel_split_kernel8(float *part,const float *q,
+        const uint8_t *latent,const float *lsc,const uint8_t *rope,const float *rsc,
+        const int *sel,const void *weights,const float *wscale,
+        int fmt,int H,int Q,int R,int V,int K,int NS,int chunk,float scale){
+    int h=blockIdx.x,p=blockIdx.y,tid=threadIdx.x,rbase=h*(Q+V);
+    int j0=p*chunk, j1=(j0+chunk<NS)?j0+chunk:NS;
+    extern __shared__ float sm[];
+    float *qa=sm,*cl=qa+K,*tsc=cl+K,*tls=tsc+COLI_ATTN_TILE,*red=tls+COLI_ATTN_TILE;
+    __shared__ float run_m,run_z;
+    float *dst=part+((size_t)h*gridDim.y+p)*(K+2);
+    if(j0>=NS){ for(int k=tid;k<K;k+=blockDim.x)dst[k]=0;
+        if(!tid){dst[K]=-3.402823466e+38F;dst[K+1]=0;} return; }
+    for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int d=0;d<Q;d++)
+        a+=q[(size_t)h*(Q+R)+d]*weight_at(weights,fmt,(size_t)(rbase+d)*row_bytes(fmt,K),k)*
+          (fmt?wscale[rbase+d]:1.f);qa[k]=a;cl[k]=0;}
+    if(!tid){run_m=-3.402823466e+38F;run_z=0;}
+    __syncthreads();
+    for(int b0=j0;b0<j1;b0+=COLI_ATTN_TILE){
+        int tn=j1-b0<COLI_ATTN_TILE?j1-b0:COLI_ATTN_TILE;
+        for(int j=tid;j<tn;j+=blockDim.x){int t=sel[b0+j];
+            const uint8_t *lt=latent+(size_t)t*K,*rt=rope+(size_t)t*R;
+            float a=fp8_row_dot(qa,lt,K);
+            float ar=fp8_row_dot(q+(size_t)h*(Q+R)+Q,rt,R);
+            tls[j]=lsc[t];
+            tsc[j]=(a*tls[j]+ar*rsc[t])*scale;}
+        __syncthreads();
+        float local=-3.402823466e+38F;
+        for(int j=tid;j<tn;j+=blockDim.x)local=fmaxf(local,tsc[j]);
+        red[tid]=local;__syncthreads();
+        for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]=fmaxf(red[tid],red[tid+n]);__syncthreads();}
+        float old_m=run_m,new_m=fmaxf(old_m,red[0]);
+        float fac=expf(old_m-new_m);
+        __syncthreads();
+        local=0;
+        for(int j=tid;j<tn;j+=blockDim.x){float e=expf(tsc[j]-new_m);tsc[j]=e;local+=e;}
+        red[tid]=local;__syncthreads();
+        for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]+=red[tid+n];__syncthreads();}
+        if(!tid){run_z=run_z*fac+red[0];run_m=new_m;}
+        for(int j=tid;j<tn;j+=blockDim.x)tsc[j]*=tls[j];
+        __syncthreads();
+        if(!(K&3)&&!((uintptr_t)latent&3)){
+            for(int kq=tid;kq<(K>>2);kq+=blockDim.x){int k0=kq<<2;
+                float a0=cl[k0]*fac,a1=cl[k0+1]*fac,a2=cl[k0+2]*fac,a3=cl[k0+3]*fac;
+                for(int j=0;j<tn;j++){uint32_t w=*(const uint32_t*)(latent+(size_t)sel[b0+j]*K+k0);float sw=tsc[j];
+                    a0+=sw*fp8_e4m3((uint8_t)(w&0xffu));a1+=sw*fp8_e4m3((uint8_t)((w>>8)&0xffu));
+                    a2+=sw*fp8_e4m3((uint8_t)((w>>16)&0xffu));a3+=sw*fp8_e4m3((uint8_t)((w>>24)&0xffu));}
+                cl[k0]=a0;cl[k0+1]=a1;cl[k0+2]=a2;cl[k0+3]=a3;}
+        } else
+        for(int k=tid;k<K;k+=blockDim.x){
+            float a=cl[k]*fac;
+            for(int j=0;j<tn;j++)a+=tsc[j]*fp8_e4m3(latent[(size_t)sel[b0+j]*K+k]);
+            cl[k]=a;}
+        __syncthreads();
+    }
+    for(int k=tid;k<K;k+=blockDim.x)dst[k]=cl[k];
+    if(!tid){dst[K]=run_m;dst[K+1]=run_z;}
+}
+
 /* OOM di SCRATCH = pressione transitoria di VRAM: il chiamante deve ripiegare
  * su CPU per QUESTA chiamata senza disabilitare per sempre il tensore dei pesi
  * (visto in prod 2026-07-16: una cascata di OOM di scratch spegneva i densi
  * per tutta la sessione). Il flag viene letto-e-azzerato dall'engine. */
-static int g_scratch_failed;
-extern "C" int coli_cuda_scratch_failed(void){ int v=g_scratch_failed; g_scratch_failed=0; return v; }
+/* Atomico: il flag e' scritto anche dal loop OMP sugli shard (piu' thread) e
+ * consumato read-and-clear; un int nudo perdeva/duplicava eventi. Inoltre viene
+ * AZZERATO all'ingresso di coli_cuda_matmul (l'unico consumatore): senza quel
+ * reset uno scratch-OOM rimasto armato da un percorso di ATTENTION riclassificava
+ * un errore duro successivo del matmul come "transitorio" e il tensore rotto non
+ * veniva mai disabilitato. */
+static std::atomic<int> g_scratch_failed{0};
+extern "C" int coli_cuda_scratch_failed(void){ return g_scratch_failed.exchange(0); }
+static inline void scratch_flag_reset(void){ g_scratch_failed.store(0); }
+static inline void scratch_flag_set(void){ g_scratch_failed.store(1); }
+
+/* Lo scratch cresce monotono col contesto (lb/rb salgono a OGNI token del
+ * decode): riallocare alla misura ESATTA significava cudaFree+cudaMalloc per
+ * token per device — churn dell'allocatore, sincronizzante, sul percorso caldo.
+ * Arrotonda la crescita del 25%. */
+static inline size_t grow_bytes(size_t bytes){
+    size_t g = bytes + bytes/4;
+    return g < bytes ? bytes : g;    /* overflow guard */
+}
 
 static int reserve(float **ptr, size_t *cap, size_t bytes) {
     if (*cap >= bytes) return 1;
     if (*ptr) cudaFree(*ptr);
     *ptr = nullptr;
     *cap = 0;
-    if (!cuda_ok(cudaMalloc(ptr, bytes), "scratch allocation")) { g_scratch_failed=1; return 0; }
-    *cap = bytes;
+    size_t want = grow_bytes(bytes);
+    if (!cuda_ok(cudaMalloc(ptr, want), "scratch allocation")) {
+        if (!cuda_ok(cudaMalloc(ptr, bytes), "scratch allocation")) { scratch_flag_set(); return 0; }
+        want = bytes;
+    }
+    *cap = want;
     return 1;
 }
 
 static int reserve_bytes(void **ptr,size_t *cap,size_t bytes){
     if(*cap>=bytes) return 1; if(*ptr) cudaFree(*ptr); *ptr=nullptr; *cap=0;
-    if(!cuda_ok(cudaMalloc(ptr,bytes),"descriptor allocation")){ g_scratch_failed=1; return 0; } *cap=bytes; return 1;
+    size_t want=grow_bytes(bytes);
+    if(!cuda_ok(cudaMalloc(ptr,want),"descriptor allocation")){
+        if(!cuda_ok(cudaMalloc(ptr,bytes),"descriptor allocation")){ scratch_flag_set(); return 0; }
+        want=bytes;
+    }
+    *cap=want; return 1;
 }
 
 static int reserve_pinned(float **ptr,size_t *cap,size_t bytes){
     if(*cap>=bytes)return 1;if(*ptr)cudaFreeHost(*ptr);*ptr=nullptr;*cap=0;
-    if(!cuda_ok(cudaMallocHost(ptr,bytes),"pinned staging allocation")){ g_scratch_failed=1; return 0; }*cap=bytes;return 1;
+    if(!cuda_ok(cudaMallocHost(ptr,bytes),"pinned staging allocation")){ scratch_flag_set(); return 0; }*cap=bytes;return 1;
 }
 
 extern "C" int coli_cuda_init(const int *devices, int count) {
@@ -650,6 +842,7 @@ extern "C" void coli_cuda_shutdown(void) {
         for(int b=0;b<24;b++) if(ctx->pipe_buf[b]) cudaFree(ctx->pipe_buf[b]);
         if (ctx->host_x) cudaFreeHost(ctx->host_x);
         if (ctx->host_y) cudaFreeHost(ctx->host_y);
+        if (ctx->kvstage) cudaFreeHost(ctx->kvstage);
         if (ctx->stream) cudaStreamDestroy(ctx->stream);
         if (ctx->group_desc) cudaFree(ctx->group_desc);
         ctx->x = ctx->y = ctx->gate = ctx->up = nullptr;
@@ -754,6 +947,7 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
                                  const void *weights, const float *scales,
                                  int fmt, int S, int I, int O, int device) {
     if (S < 1 || !coli_cuda_tensor_upload(tensor, weights, scales, fmt, I, O, device)) return 0;
+    scratch_flag_reset();    /* solo i fallimenti di QUESTA chiamata sono "transitori" */
     ColiCudaTensor *t = *tensor;
     DeviceContext *ctx = find_ctx(t->device);
     if (!select_ctx(ctx)) return 0;
@@ -761,8 +955,7 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
     if (!reserve(&ctx->x, &ctx->x_cap, xb) || !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
     if (!cuda_ok(cudaMemcpy(ctx->x, x, xb, cudaMemcpyHostToDevice), "input upload")) return 0;
-    dim3 grid((unsigned)O, (unsigned)S);
-    quant_matmul<<<grid, 256>>>(ctx->y, ctx->x, t->weights, t->scales, fmt, S, I, O, rb);
+    quant_matmul_rows(ctx->y, ctx->x, t->weights, t->scales, fmt, S, I, O, rb, 0);
     if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
         !cuda_ok(cudaMemcpy(y, ctx->y, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
     return 1;
@@ -783,15 +976,14 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
     if (!reserve(&ctx->x,&ctx->x_cap,xb) || !reserve(&ctx->y,&ctx->y_cap,yb) ||
         !reserve(&ctx->gate,&ctx->gate_cap,ib) || !reserve(&ctx->up,&ctx->up_cap,ib)) return 0;
     if (!cuda_ok(cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice),"expert input upload")) return 0;
-    dim3 hidden_grid((unsigned)I,(unsigned)S), output_grid((unsigned)D,(unsigned)S);
-    quant_matmul<<<hidden_grid,256>>>(ctx->gate,ctx->x,gate->weights,gate->scales,
-        gate->fmt,S,D,I,row_bytes(gate->fmt,D));
-    quant_matmul<<<hidden_grid,256>>>(ctx->up,ctx->x,up->weights,up->scales,
-        up->fmt,S,D,I,row_bytes(up->fmt,D));
+    quant_matmul_rows(ctx->gate,ctx->x,gate->weights,gate->scales,
+        gate->fmt,S,D,I,row_bytes(gate->fmt,D),0);
+    quant_matmul_rows(ctx->up,ctx->x,up->weights,up->scales,
+        up->fmt,S,D,I,row_bytes(up->fmt,D),0);
     size_t n=(size_t)S*I;
     silu_mul<<<(unsigned)((n+255)/256),256>>>(ctx->gate,ctx->up,n);
-    quant_matmul<<<output_grid,256>>>(ctx->y,ctx->gate,down->weights,down->scales,
-        down->fmt,S,I,D,row_bytes(down->fmt,I));
+    quant_matmul_rows(ctx->y,ctx->gate,down->weights,down->scales,
+        down->fmt,S,I,D,row_bytes(down->fmt,I),0);
     if (!cuda_ok(cudaGetLastError(),"expert MLP launch") ||
         !cuda_ok(cudaMemcpy(y,ctx->y,yb,cudaMemcpyDeviceToHost),"expert output download")) return 0;
     return 1;
@@ -995,8 +1187,8 @@ static int attention_absorb_batch_run(ColiCudaTensor *w,ColiCudaTensor *proj,flo
     const float *src=dc->ac;size_t ob=cb;
     if(proj){
         ob=(size_t)S*proj->O*sizeof(float);if(!reserve(&dc->y,&dc->y_cap,ob))return 0;
-        quant_matmul<<<dim3(proj->O,S),256,0,dc->stream>>>(dc->y,dc->ac,proj->weights,
-            proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I));
+        quant_matmul_rows(dc->y,dc->ac,proj->weights,
+            proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I),dc->stream);
         if(!cuda_ok(cudaGetLastError(),"attention o_proj launch"))return 0;src=dc->y;
     }
     if(!cuda_ok(cudaMemcpyAsync(out,src,ob,cudaMemcpyDeviceToHost,dc->stream),
@@ -1055,7 +1247,7 @@ extern "C" int coli_cuda_attention_absorb8(ColiCudaTensor *w,float *ctx,const fl
        !cuda_ok(cudaMemcpyAsync(dc->ar,rope,rb,cudaMemcpyHostToDevice,dc->stream),"attention fp8 rope upload")||
        !cuda_ok(cudaMemcpyAsync(dc->arsc,rsc,sb,cudaMemcpyHostToDevice,dc->stream),"attention rope scale upload"))return 0;
     if(T<=4096){
-        size_t shared=(size_t)(2*K+T)*sizeof(float);
+        size_t shared=(size_t)(2*K+T+256)*sizeof(float);
         attention_absorb_kernel8<<<H,256,shared,dc->stream>>>(dc->ac,dc->aq,(const uint8_t*)dc->al,
             dc->alsc,(const uint8_t*)dc->ar,dc->arsc,w->weights,w->scales,w->fmt,H,Q,R,V,K,T,scale);
     } else {                                   /* oltre il tetto smem: split-T + merge */
@@ -1100,8 +1292,8 @@ static int attention_absorb_batch_run8(ColiCudaTensor *w,ColiCudaTensor *proj,fl
     const float *src=dc->ac;size_t ob=cb;
     if(proj){
         ob=(size_t)S*proj->O*sizeof(float);if(!reserve(&dc->y,&dc->y_cap,ob))return 0;
-        quant_matmul<<<dim3(proj->O,S),256,0,dc->stream>>>(dc->y,dc->ac,proj->weights,
-            proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I));
+        quant_matmul_rows(dc->y,dc->ac,proj->weights,
+            proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I),dc->stream);
         if(!cuda_ok(cudaGetLastError(),"attention o_proj launch"))return 0;src=dc->y;
     }
     if(!cuda_ok(cudaMemcpyAsync(out,src,ob,cudaMemcpyDeviceToHost,dc->stream),
@@ -1134,7 +1326,7 @@ extern "C" int coli_cuda_attention_absorb_kvdev8(ColiCudaTensor *w,float *ctx,co
     if(!reserve(&dc->aq,&dc->aq_cap,qb)||!reserve(&dc->ac,&dc->ac_cap,cb))return 0;
     if(!cuda_ok(cudaMemcpyAsync(dc->aq,q,qb,cudaMemcpyHostToDevice,dc->stream),"kvdev8 q upload"))return 0;
     if(T<=4096){
-        size_t shared=(size_t)(2*K+T)*sizeof(float);
+        size_t shared=(size_t)(2*K+T+256)*sizeof(float);
         attention_absorb_kernel8<<<H,256,shared,dc->stream>>>(dc->ac,dc->aq,latent_dev,lsc_dev,
             rope_dev,rsc_dev,w->weights,w->scales,w->fmt,H,Q,R,V,K,T,scale);
     } else {                                   /* oltre il tetto smem: split-T + merge */
@@ -1160,9 +1352,26 @@ extern "C" int coli_cuda_attention_absorb_kvdev8_sel(ColiCudaTensor *w,float *ct
        !reserve(&dc->asel,&dc->asel_cap,sb))return 0;
     if(!cuda_ok(cudaMemcpyAsync(dc->aq,q,qb,cudaMemcpyHostToDevice,dc->stream),"kvdev8 sel q upload")||
        !cuda_ok(cudaMemcpyAsync(dc->asel,sel,sb,cudaMemcpyHostToDevice,dc->stream),"kvdev8 sel list upload"))return 0;
-    size_t shared=(size_t)(2*K+NS)*sizeof(float);
+    if(NS>=1024){
+        /* H blocchi non riempiono la GPU (ncu: 16.7%% occupancy, 6.6%% SM sul
+         * decode DSA di produzione): split della lista in P parziali + merge. */
+        int P=(NS+1023)/1024; if(P>64)P=64;
+        int chunk=(NS+P-1)/P;
+        size_t pb=(size_t)H*P*(K+2)*sizeof(float);
+        if(!reserve(&dc->apart,&dc->apart_cap,pb))return 0;
+        size_t sh1=(size_t)(2*K+2*COLI_ATTN_TILE+256)*sizeof(float);
+        attention_absorb_sel_split_kernel8<<<dim3(H,P),256,sh1,dc->stream>>>(dc->apart,dc->aq,
+            latent_dev,lsc_dev,rope_dev,rsc_dev,(const int*)dc->asel,
+            w->weights,w->scales,w->fmt,H,Q,R,V,K,NS,chunk,scale);
+        if(!cuda_ok(cudaGetLastError(),"kvdev8 sel split launch"))return 0;
+        size_t sh2=(size_t)(K+256)*sizeof(float);
+        attention_absorb_merge_kernel8<<<H,256,sh2,dc->stream>>>(dc->ac,dc->apart,
+            w->weights,w->scales,w->fmt,H,Q,R,V,K,P);
+    } else {
+    size_t shared=(size_t)(2*K+NS+256)*sizeof(float);
     attention_absorb_sel_kernel8<<<H,256,shared,dc->stream>>>(dc->ac,dc->aq,latent_dev,lsc_dev,
         rope_dev,rsc_dev,(const int*)dc->asel,w->weights,w->scales,w->fmt,H,Q,R,V,K,NS,scale);
+    }
     if(!cuda_ok(cudaGetLastError(),"kvdev8 sel launch")||
        !cuda_ok(cudaMemcpyAsync(ctx,dc->ac,cb,cudaMemcpyDeviceToHost,dc->stream),"kvdev8 sel ctx download")||
        !cuda_ok(cudaStreamSynchronize(dc->stream),"kvdev8 sel synchronize"))return 0;
@@ -1194,8 +1403,8 @@ extern "C" int coli_cuda_attention_project_batch_kvdev8(ColiCudaTensor *w,ColiCu
     if(!cuda_ok(cudaGetLastError(),"kvdev8 batch launch"))return 0;
     size_t ob=(size_t)S*proj->O*sizeof(float);
     if(!reserve(&dc->y,&dc->y_cap,ob))return 0;
-    quant_matmul<<<dim3(proj->O,S),256,0,dc->stream>>>(dc->y,dc->ac,proj->weights,
-        proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I));
+    quant_matmul_rows(dc->y,dc->ac,proj->weights,
+        proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I),dc->stream);
     if(!cuda_ok(cudaGetLastError(),"kvdev8 o_proj launch")||
        !cuda_ok(cudaMemcpyAsync(out,dc->y,ob,cudaMemcpyDeviceToHost,dc->stream),"kvdev8 out download")||
        !cuda_ok(cudaStreamSynchronize(dc->stream),"kvdev8 batch synchronize"))return 0;
@@ -1296,6 +1505,42 @@ extern "C" int coli_cuda_pipe_upload(int device,void *dst,const void *src,size_t
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
     return cuda_ok(cudaMemcpy(dst,src,bytes,cudaMemcpyHostToDevice),"pipe upload");
 }
+/* Upload ORDINATO sullo stream dei kernel (ctx->stream). La variante sincrona
+ * sopra viaggia sul NULL stream: con sorgente pageable la cudaMemcpy puo'
+ * tornare mentre il DMA e' ancora in volo, e i kernel kvdev8 (stream
+ * non-blocking) potevano leggere righe/scale stantie del token piu' recente.
+ * Qui: staging pinned + cudaMemcpyAsync sullo stesso stream dei kernel — la
+ * race sparisce per ordinamento e l'host non si blocca (il decode pagava 4
+ * copie bloccanti per layer per token, due da 4 byte). Il ring si riusa dopo
+ * una sync di stream (ogni chiamata attention termina con una). */
+extern "C" int coli_cuda_pipe_upload_async(int device,void *dst,const void *src,size_t bytes){
+    DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
+    if(!bytes) return 1;
+    if(bytes<=((size_t)16<<20)){
+        if(ctx->kvstage_cap<bytes){
+            if(!cuda_ok(cudaStreamSynchronize(ctx->stream),"kv stage sync")) return 0;
+            if(ctx->kvstage) cudaFreeHost(ctx->kvstage);
+            size_t cap=bytes<((size_t)4<<20)?((size_t)4<<20):grow_bytes(bytes);
+            ctx->kvstage=nullptr; ctx->kvstage_cap=0; ctx->kvstage_off=0;
+            if(cuda_ok(cudaMallocHost((void**)&ctx->kvstage,cap),"kv stage alloc"))
+                ctx->kvstage_cap=cap;
+            else ctx->kvstage=nullptr;               /* fail-soft: pageable sotto */
+        }
+        if(ctx->kvstage){
+            if(ctx->kvstage_off+bytes>ctx->kvstage_cap){
+                if(!cuda_ok(cudaStreamSynchronize(ctx->stream),"kv stage wrap")) return 0;
+                ctx->kvstage_off=0;
+            }
+            uint8_t *st=ctx->kvstage+ctx->kvstage_off;
+            memcpy(st,src,bytes); ctx->kvstage_off+=bytes;
+            return cuda_ok(cudaMemcpyAsync(dst,st,bytes,cudaMemcpyHostToDevice,ctx->stream),
+                           "pipe upload async");
+        }
+    }
+    /* pageable: la copia degrada a staged-sincrona ma RESTA ordinata sullo stream */
+    return cuda_ok(cudaMemcpyAsync(dst,src,bytes,cudaMemcpyHostToDevice,ctx->stream),
+                   "pipe upload async");
+}
 extern "C" int coli_cuda_pipe_download(int device,const void *src,void *dst,size_t bytes){
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
     return cuda_ok(cudaMemcpy(dst,src,bytes,cudaMemcpyDeviceToHost),"pipe download");
@@ -1354,8 +1599,8 @@ extern "C" int coli_cuda_attention_project_batch_dev(ColiCudaTensor *w,ColiCudaT
     if(!cuda_ok(cudaGetLastError(),"pipe attention launch"))return 0;
     size_t ob=(size_t)S*proj->O*sizeof(float);
     if(!reserve(&dc->y,&dc->y_cap,ob))return 0;
-    quant_matmul<<<dim3(proj->O,S),256,0,dc->stream>>>(dc->y,dc->ac,proj->weights,
-        proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I));
+    quant_matmul_rows(dc->y,dc->ac,proj->weights,
+        proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I),dc->stream);
     if(!cuda_ok(cudaGetLastError(),"pipe o_proj launch"))return 0;
     if(!cuda_ok(cudaMemcpyAsync(out,dc->y,ob,cudaMemcpyDeviceToHost,dc->stream),"pipe attention download")||
        !cuda_ok(cudaStreamSynchronize(dc->stream),"pipe attention sync"))return 0;
@@ -1384,9 +1629,8 @@ extern "C" int coli_cuda_pipe_gemm(ColiCudaTensor *t,float *y_dev,const float *x
                                    int S){
     if(!t||S<1) return 0;
     DeviceContext *ctx=find_ctx(t->device); if(!select_ctx(ctx)) return 0;
-    dim3 grid((unsigned)t->O,(unsigned)S);
-    quant_matmul<<<grid,256>>>(y_dev,x_dev,t->weights,t->scales,t->fmt,S,t->I,t->O,
-        row_bytes(t->fmt,t->I));
+    quant_matmul_rows(y_dev,x_dev,t->weights,t->scales,t->fmt,S,t->I,t->O,
+        row_bytes(t->fmt,t->I),0);
     return cuda_ok(cudaGetLastError(),"pipe gemm");
 }
 /* copia diretta scheda->scheda (P2P se disponibile, altrimenti staging driver) */
@@ -1411,8 +1655,8 @@ extern "C" int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor *w,ColiC
     attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(dc->ac,q_dev,latent_dev,
         rope_dev,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
     if(!cuda_ok(cudaGetLastError(),"pipe attention launch (dev out)"))return 0;
-    quant_matmul<<<dim3(proj->O,S),256,0,dc->stream>>>(out_dev,dc->ac,proj->weights,
-        proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I));
+    quant_matmul_rows(out_dev,dc->ac,proj->weights,
+        proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I),dc->stream);
     if(!cuda_ok(cudaGetLastError(),"pipe o_proj launch (dev out)"))return 0;
     return cuda_ok(cudaStreamSynchronize(dc->stream),"pipe attention sync (dev out)");
 }

@@ -198,6 +198,11 @@ int main(int argc, char **argv) {
             dense_ref(sel,nsel,ref2);
             if(!coli_cuda_attention_absorb_kvdev8_sel(at8,got2,lq8,dL,dLs,dR,dRs,sel,nsel,1,2,2,2,4,1.f)||
                !relative_rms(got2,ref2,2,1e-3f)){std::fprintf(stderr,"kvdev8_sel mismatch\n");return 1;}
+            /* (c2) small-NS single-block branch (the split path takes NS>=1024) */
+            int nsel2=500;
+            dense_ref(sel,nsel2,ref2);
+            if(!coli_cuda_attention_absorb_kvdev8_sel(at8,got2,lq8,dL,dLs,dR,dRs,sel,nsel2,1,2,2,2,4,1.f)||
+               !relative_rms(got2,ref2,2,1e-3f)){std::fprintf(stderr,"kvdev8_sel small-NS mismatch\n");return 1;}
             /* (d) parity: streaming vs capped kernel on the SAME data at T=3000 */
             float cap2[2];
             if(!coli_cuda_attention_absorb8(at8,cap2,lq8,Lq,Ls,Rq,Rs,1,2,2,2,4,3000,1.f))return 1;

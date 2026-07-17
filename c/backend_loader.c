@@ -86,6 +86,7 @@ typedef float * (*fn_pipe_scratch)(int device,int slot,size_t bytes);
 typedef int (*fn_pipe_silu_mul)(int device,float *gate_dev,const float *up_dev,size_t n);
 typedef int (*fn_pipe_sync)(int device);
 typedef int (*fn_pipe_upload)(int device,void *dst,const void *src,size_t bytes);
+typedef int (*fn_pipe_upload_async)(int device,void *dst,const void *src,size_t bytes);
 typedef int (*fn_shared_mlp_w4a16)(ColiCudaTensor *gate, ColiCudaTensor *up, ColiCudaTensor *down, float *y, const float *x, int S);
 typedef int (*fn_tensor_update)(ColiCudaTensor *tensor, const void *weights, const float *scales);
 
@@ -139,6 +140,7 @@ static struct {
     fn_pipe_silu_mul pipe_silu_mul;
     fn_pipe_sync pipe_sync;
     fn_pipe_upload pipe_upload;
+    fn_pipe_upload_async pipe_upload_async;   /* opzionale: dll vecchie non ce l'hanno */
     fn_shared_mlp_w4a16 shared_mlp_w4a16;
     fn_tensor_update tensor_update;
 } g_cuda;
@@ -239,6 +241,11 @@ static int coli_cuda_load(void){
     RESOLVE(pipe_silu_mul, fn_pipe_silu_mul)
     RESOLVE(pipe_sync, fn_pipe_sync)
     RESOLVE(pipe_upload, fn_pipe_upload)
+    /* opzionale (dll pre-2026-07): fallback al pipe_upload sincrono nel wrapper */
+    _Pragma("GCC diagnostic push")
+    _Pragma("GCC diagnostic ignored \"-Wcast-function-type\"")
+    g_cuda.pipe_upload_async = (fn_pipe_upload_async)GetProcAddress(g_cuda.dll, "coli_cuda_pipe_upload_async");
+    _Pragma("GCC diagnostic pop")
     RESOLVE(shared_mlp_w4a16, fn_shared_mlp_w4a16)
     RESOLVE(tensor_update, fn_tensor_update)
     #undef RESOLVE
@@ -486,6 +493,12 @@ int coli_cuda_pipe_sync(int device){
 int coli_cuda_pipe_upload(int device,void *dst,const void *src,size_t bytes){
     if(!g_cuda.available){ return 0; }
     return g_cuda.pipe_upload(device, dst, src, bytes);
+}
+
+int coli_cuda_pipe_upload_async(int device,void *dst,const void *src,size_t bytes){
+    if(!g_cuda.available){ return 0; }
+    if(g_cuda.pipe_upload_async) return g_cuda.pipe_upload_async(device, dst, src, bytes);
+    return g_cuda.pipe_upload(device, dst, src, bytes);   /* dll vecchia: sincrono */
 }
 
 int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate, ColiCudaTensor *up, ColiCudaTensor *down, float *y, const float *x, int S){
