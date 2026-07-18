@@ -1509,24 +1509,27 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         if(getenv("MTP") && atoi(getenv("MTP"))==0) m->has_mtp=0;
         if(m->has_mtp){
             int i=c->n_layers; Layer *l=&m->mtpL;
+            /* MTP_FP32=1: load the MTP head's dense weights at f32 (bits>=16 -> fmt=0),
+             * bypassing the int8 idot kernel — diagnostic for the 0%-acceptance bug (#mtp). */
+            int mbits = (getenv("MTP_FP32") && atoi(getenv("MTP_FP32"))) ? 32 : dbits;
             #define PM(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
             l->in_ln=ld(m,PM("input_layernorm.weight"));
             l->post_ln=ld(m,PM("post_attention_layernorm.weight"));
-            l->q_a   = qt_load(m,PM("self_attn.q_a_proj.weight"), c->q_lora, D, dbits);
+            l->q_a   = qt_load(m,PM("self_attn.q_a_proj.weight"), c->q_lora, D, mbits);
             l->q_a_ln= ld(m,PM("self_attn.q_a_layernorm.weight"));
-            l->q_b   = qt_load(m,PM("self_attn.q_b_proj.weight"), H*c->qk_head, c->q_lora, dbits);
-            l->kv_a  = qt_load(m,PM("self_attn.kv_a_proj_with_mqa.weight"), c->kv_lora+c->qk_rope, D, dbits);
+            l->q_b   = qt_load(m,PM("self_attn.q_b_proj.weight"), H*c->qk_head, c->q_lora, mbits);
+            l->kv_a  = qt_load(m,PM("self_attn.kv_a_proj_with_mqa.weight"), c->kv_lora+c->qk_rope, D, mbits);
             l->kv_a_ln= ld(m,PM("self_attn.kv_a_layernorm.weight"));
-            l->kv_b  = qt_load(m,PM("self_attn.kv_b_proj.weight"), H*(c->qk_nope+c->v_head), c->kv_lora, dbits);
-            l->o     = qt_load(m,PM("self_attn.o_proj.weight"), D, H*c->v_head, dbits);
+            l->kv_b  = qt_load(m,PM("self_attn.kv_b_proj.weight"), H*(c->qk_nope+c->v_head), c->kv_lora, mbits);
+            l->o     = qt_load(m,PM("self_attn.o_proj.weight"), D, H*c->v_head, mbits);
             l->sparse=1;
             l->router=ld(m,PM("mlp.gate.weight"));
             l->router_bias=ld(m,PM("mlp.gate.e_score_correction_bias"));
             int sI=c->moe_inter*c->n_shared;
-            l->sh_gate = qt_load(m,PM("mlp.shared_experts.gate_proj.weight"), sI, D, dbits);
-            l->sh_up   = qt_load(m,PM("mlp.shared_experts.up_proj.weight"),   sI, D, dbits);
-            l->sh_down = qt_load(m,PM("mlp.shared_experts.down_proj.weight"), D, sI, dbits);
-            m->eh_proj = qt_load(m,PM("eh_proj.weight"), D, 2*D, dbits);
+            l->sh_gate = qt_load(m,PM("mlp.shared_experts.gate_proj.weight"), sI, D, mbits);
+            l->sh_up   = qt_load(m,PM("mlp.shared_experts.up_proj.weight"),   sI, D, mbits);
+            l->sh_down = qt_load(m,PM("mlp.shared_experts.down_proj.weight"), D, sI, mbits);
+            m->eh_proj = qt_load(m,PM("eh_proj.weight"), D, 2*D, mbits);
             m->enorm=ld(m,PM("enorm.weight")); m->hnorm=ld(m,PM("hnorm.weight"));
             m->mtp_norm=ld(m,PM("shared_head.norm.weight"));
             m->ecache[i]=calloc(cap,sizeof(ESlot));
