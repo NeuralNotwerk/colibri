@@ -166,7 +166,7 @@ else
 PYTHON    ?= python3
 endif
 CUDA_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_kv_alloc$(EXE) tests/test_kv_fp8$(EXE) tests/test_kv_disk$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_kv_alloc$(EXE) tests/test_kv_fp8$(EXE) tests/test_kv_tq$(EXE) tests/test_kv_disk$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE)
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
@@ -301,6 +301,9 @@ tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c glm.c st.h json.h tok.h tok_uni
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_kv_fp8$(EXE): tests/test_kv_fp8.c kv_fp8.h decode_batch.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_kv_tq$(EXE): tests/test_kv_tq.c kv_tq.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_kv_disk$(EXE): tests/test_kv_disk.c glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h kv_fp8.h
