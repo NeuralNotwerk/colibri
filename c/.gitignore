@@ -5,3 +5,14 @@ olmoe_i4/
 .build-config
 tests/test_st_mirror
 tests/test_st_pread
+
+# compiled test/bench binaries (Mach-O/ELF, no extension); sources kept via negation
+tests/test_*
+tests/bench_*
+backend_metal_test
+backend_cuda_test
+!tests/*.c
+!tests/*.cu
+!tests/*.mm
+!tests/*.h
+!tests/*.py
