@@ -5871,6 +5871,19 @@ typedef struct { int l,e; uint32_t c; } PinRec;
 static int pin_rec_cmp(const void *a,const void *b){
     const PinRec *x=a,*y=b; return x->c<y->c?1:x->c>y->c?-1:0;
 }
+/* Offset-ordered pin I/O: rank decides WHICH experts are pinned and where; (fd,off)
+ * decides the ORDER they are read. Rank-adjacent experts live in different shard
+ * files, so loading in rank order is a worst-case random walk over the weight files
+ * (measured 0.24 GB/s aggregate on a ZFS NVMe mirror, drives pegged at tiny random
+ * reads); sorted by file offset the same reads stream sequentially and the OS
+ * prefetcher does the rest. The permutation only changes the iteration order of the
+ * load loops — selection, slot assignment and the VRAM-priority upload are untouched. */
+typedef struct { int fd; int64_t off; int idx; } PinOrd;
+static int pin_ord_cmp(const void *a,const void *b){
+    const PinOrd *x=a,*y=b;
+    if(x->fd!=y->fd) return x->fd<y->fd?-1:1;
+    return x->off<y->off?-1:x->off>y->off?1:0;
+}
 
 #ifdef __linux__
 /* #419: bind the pinned hot-store as ONE arena per layer instead of one mbind
@@ -6008,12 +6021,27 @@ static void pin_load(Model *m, const char *statspath, double gb){
 #endif
     /* Load the VRAM-ranked prefix first.  Once uploaded its host backing is
      * released before the disjoint RAM-ranked suffix is allocated. */
+    /* Build the offset-ordered I/O permutation (see PinOrd above). The two segments
+     * [0,gpu_prefix) and [gpu_prefix,npin) sort independently: the prefix must still
+     * be fully loaded before the VRAM upload below, the suffix after the release —
+     * the barriers between the phases are unchanged. */
+    PinOrd *ord=malloc((size_t)npin*sizeof(PinOrd));
+    for(int a=0;a<npin;a++){
+        char onm[288];
+        snprintf(onm,sizeof(onm),"model.layers.%d.mlp.experts.%d.gate_proj.weight",r[a].l,r[a].e);
+        st_tensor *ot=st_find(&m->S,onm);
+        ord[a]=(PinOrd){ot?ot->fd:0,ot?ot->off:0,a};
+    }
+    int seg0=gpu_prefix?gpu_prefix:npin;
+    qsort(ord,(size_t)seg0,sizeof(PinOrd),pin_ord_cmp);
+    if(gpu_prefix>0&&gpu_prefix<npin)
+        qsort(ord+gpu_prefix,(size_t)(npin-gpu_prefix),sizeof(PinOrd),pin_ord_cmp);
 #ifdef __linux__
     if(gpu_prefix>0) g_numa_skip_bind=1;   /* prefix slabs = transient upload staging: don't bind (#419) */
 #endif
     #pragma omp parallel for schedule(dynamic,1)
-    for(int a=0;a<(gpu_prefix?gpu_prefix:npin);a++)
-        expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
+    for(int k=0;k<seg0;k++){ int a=ord[k].idx;
+        expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0); }  /* startup pin load; demand=0, never classified */
 #ifdef __linux__
     g_numa_skip_bind=0;
 #endif
@@ -6062,14 +6090,14 @@ static void pin_load(Model *m, const char *statspath, double gb){
 #endif
     if(gpu_prefix>0&&gpu_prefix<npin){
         #pragma omp parallel for schedule(dynamic,1)
-        for(int a=gpu_prefix;a<npin;a++)
-            expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
+        for(int k=gpu_prefix;k<npin;k++){ int a=ord[k].idx;
+            expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0); }  /* startup pin load; demand=0, never classified */
         m->resident_bytes+=(int64_t)(npin-gpu_prefix)*eb;
     }
     fprintf(stderr,"[PIN] placement: %d VRAM + %d RAM expert (%.1f GB warm) in %.0fs da %s\n",
         m->gpu_expert_count,npin-m->gpu_expert_count,(npin-m->gpu_expert_count)*eb/1e9,now_s()-t0,statspath);
     pin_wire(m);                                   /* inchioda in RAM (no compressione) / wire in RAM (no compression) */
-    free(r); free(cnt_l); free(slot_of); free(next);
+    free(r); free(cnt_l); free(slot_of); free(next); free(ord);
 }
 
 static double g_mem_avail_boot=0;   /* MemAvailable all'avvio, prima di caricare il modello */
